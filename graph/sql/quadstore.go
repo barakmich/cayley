@@ -19,11 +19,14 @@ func init() {
 }
 
 type QuadStore struct {
-	db *sql.DB
+	db        *sql.DB
+	sqlFlavor string
+	size      int64
+	lru       *cache
 }
 
 func connectSQLTables(addr string, _ graph.Options) (*sql.DB, error) {
-	// TODO(barakmich): Parse options for more friendly addr.
+	// TODO(barakmich): Parse options for more friendly addr, other SQLs.
 	conn, err := sql.Open("postgres", addr)
 	if err != nil {
 		glog.Errorf("Couldn't open database at %s: %#v", addr, err)
@@ -43,24 +46,19 @@ func createSQLTables(addr string, options graph.Options) error {
 		return err
 	}
 
-	tripleTable, err := tx.Exec(`
+	quadTable, err := tx.Exec(`
 	CREATE TABLE quads (
 		subject TEXT NOT NULL,
 		predicate TEXT NOT NULL,
 		object TEXT NOT NULL,
 		label TEXT,
 		horizon BIGSERIAL PRIMARY KEY,
+		id BIGINT,
+		ts timestamp,
 		UNIQUE(subject, predicate, object, label)
 	);`)
 	if err != nil {
-		return err
-	}
-	nodeTable, err := tx.Exec(`
-	CREATE TABLE nodes (
-		node TEXT NOT NULL,
-		size BIGINT NOT NULL
-	);`)
-	if err != nil {
+		glog.Errorf("Cannot create quad table: %v", quadTable)
 		return err
 	}
 	index, err := tx.Exec(`
@@ -70,6 +68,7 @@ func createSQLTables(addr string, options graph.Options) error {
 	CREATE INDEX cps_index ON quads (label, predicate, subject);
 	`)
 	if err != nil {
+		glog.Errorf("Cannot create indices: %v", index)
 		return err
 	}
 	tx.Commit()
@@ -83,15 +82,66 @@ func newQuadStore(addr string, options graph.Options) (graph.QuadStore, error) {
 		return nil, err
 	}
 	qs.db = conn
+	qs.sqlFlavor = "postgres"
+	qs.size = -1
+	qs.lru = newCache(1024)
 	return &qs, nil
 }
 
-func (qs *QuadStore) getIDForQuad(t quad.Quad) string {
-	return fmt.Sprintf("(%s, %s, %s, %s)")
+func (qs *QuadStore) buildTxPostgres(tx *sql.Tx, in []graph.Delta) error {
+	insert, err := tx.Prepare(`INSERT INTO quads(subject, predicate, object, label, id, ts) VALUES ($1, $2, $3, $4, $5, $6)`)
+	if err != nil {
+		glog.Errorf("Cannot prepare insert statement: %v", err)
+		return err
+	}
+	for _, d := range in {
+		switch d.Action {
+		case graph.Add:
+			_, err := insert.Exec(d.Quad.Subject, d.Quad.Predicate, d.Quad.Object, d.Quad.Label, d.ID.Int(), d.Timestamp)
+			if err != nil {
+				glog.Errorf("couldn't prepare INSERT statement: %v", err)
+				return err
+			}
+			//for _, dir := range quad.Directions {
+			//_, err := tx.Exec(`
+			//WITH upsert AS (UPDATE nodes SET size=size+1 WHERE node=$1 RETURNING *)
+			//INSERT INTO nodes (node, size) SELECT $1, 1 WHERE NOT EXISTS (SELECT * FROM UPSERT);
+			//`, d.Quad.Get(dir))
+			//if err != nil {
+			//glog.Errorf("couldn't prepare upsert statement in direction %s: %v", dir, err)
+			//return err
+			//}
+			//}
+		case graph.Delete:
+			_, err := tx.Exec(`DELETE FROM quads WHERE subject=$1 and predicate=$2 and object=$3 and label=$4;`,
+				d.Quad.Subject, d.Quad.Predicate, d.Quad.Object, d.Quad.Label)
+			if err != nil {
+				glog.Errorf("couldn't prepare DELETE statement: %v", err)
+			}
+			//for _, dir := range quad.Directions {
+			//tx.Exec(`UPDATE nodes SET size=size-1 WHERE node=$1;`, d.Quad.Get(dir))
+			//}
+		default:
+			panic("unknown action")
+		}
+	}
+	return nil
 }
 
-func (qs *QuadStore) ApplyDeltas(in []graph.Delta, ignoreOpts graph.IgnoreOpts) error {
-	return nil
+func (qs *QuadStore) ApplyDeltas(in []graph.Delta, _ graph.IgnoreOpts) error {
+	// TODO(barakmich): Support ignoreOpts? "ON CONFLICT IGNORE"
+	tx, err := qs.db.Begin()
+	if err != nil {
+		glog.Errorf("couldn't begin write transaction: %v", err)
+		return err
+	}
+	switch qs.sqlFlavor {
+	case "postgres":
+		qs.buildTxPostgres(tx, in)
+	default:
+		panic("no support for flavor: " + qs.sqlFlavor)
+	}
+	return tx.Commit()
 }
 
 func (qs *QuadStore) Quad(val graph.Value) quad.Quad {
@@ -119,14 +169,17 @@ func (qs *QuadStore) NameOf(v graph.Value) string {
 }
 
 func (qs *QuadStore) Size() int64 {
-	var count int64
+	// TODO(barakmich): Sync size with writes.
+	if qs.size != -1 {
+		return qs.size
+	}
 	c := qs.db.QueryRow("SELECT COUNT(*) FROM quads;")
-	err := c.Scan(&count)
+	err := c.Scan(&qs.size)
 	if err != nil {
 		glog.Errorf("Couldn't execute COUNT: %v", err)
 		return 0
 	}
-	return count
+	return qs.size
 }
 
 func (qs *QuadStore) Horizon() graph.PrimaryKey {
@@ -189,4 +242,24 @@ func (qs *QuadStore) optimizeLinksTo(it *iterator.LinksTo) (graph.Iterator, bool
 		}
 	}
 	return it, false
+}
+
+func (qs *QuadStore) sizeForIterator(isAll bool, dir quad.Direction, val string) int64 {
+	var err error
+	if isAll {
+		return qs.Size()
+	}
+	if val, ok := qs.lru.Get(val + string(dir.Prefix())); ok {
+		return val
+	}
+	var size int64
+	glog.V(4).Infoln("sql: getting size for select %s, %s", dir.String(), val)
+	err = qs.db.QueryRow(
+		fmt.Sprintf("SELECT count(*) FROM quads WHERE %s = $1;", dir.String()), val).Scan(&size)
+	if err != nil {
+		glog.Errorln("Error getting size from SQL database: %v", err)
+		return 0
+	}
+	qs.lru.Put(val+string(dir.Prefix()), size)
+	return size
 }

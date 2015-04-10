@@ -19,8 +19,6 @@ import (
 	"fmt"
 
 	"github.com/barakmich/glog"
-	"gopkg.in/mgo.v2"
-	"gopkg.in/mgo.v2/bson"
 
 	"github.com/google/cayley/graph"
 	"github.com/google/cayley/graph/iterator"
@@ -41,27 +39,39 @@ type Iterator struct {
 }
 
 func (it *Iterator) makeCursor() {
-	var cursor *db.Rows
+	var cursor *sql.Rows
+	var err error
 	if it.cursor != nil {
 		it.cursor.Close()
 	}
 	if it.isAll {
 		if it.table == "quads" {
-			cursor, err := qs.db.QueryRows(`SELECT subject, predicate, object, label FROM quads;`)
+			cursor, err = it.qs.db.Query(`SELECT subject, predicate, object, label FROM quads;`)
 			if err != nil {
 				glog.Errorln("Couldn't get cursor from SQL database: %v", err)
 				cursor = nil
 			}
 		} else {
-			cursor, err := qs.db.QueryRows(`SELECT node FROM nodes;`)
+			glog.V(4).Infoln("sql: getting node query")
+			cursor, err = it.qs.db.Query(`SELECT node FROM
+			(
+				SELECT subject FROM quads
+				UNION
+				SELECT predicate FROM quads
+				UNION
+				SELECT object FROM quads
+				UNION
+				SELECT label FROM quads
+			) AS DistinctNodes (node) WHERE node IS NOT NULL;`)
 			if err != nil {
 				glog.Errorln("Couldn't get cursor from SQL database: %v", err)
 				cursor = nil
 			}
+			glog.V(4).Infoln("sql: got node query")
 		}
 	} else {
-		cursor, err := qs.db.QueryRows(`
-		SELECT subject, predicate, object, label FROM quads WHERE ? = ?;`, d.String(), val.(string))
+		cursor, err = it.qs.db.Query(
+			fmt.Sprintf("SELECT subject, predicate, object, label FROM quads WHERE %s = $1;", it.dir.String()), it.val.(string))
 		if err != nil {
 			glog.Errorln("Couldn't get cursor from SQL database: %v", err)
 			cursor = nil
@@ -71,43 +81,29 @@ func (it *Iterator) makeCursor() {
 }
 
 func NewIterator(qs *QuadStore, d quad.Direction, val graph.Value) *Iterator {
-	var size int64
-	err := qs.db.QueryRow(`SELECT count(*) FROM quads WHERE ? = ?;`, d.String(), val.(string)).Scan(&size)
-	if err != nil {
-		glog.Errorln("Error getting size from SQL database: %v", err)
-		return nil
-	}
 	it := &Iterator{
-		uid:    iterator.NextUID(),
-		qs:     qs,
-		dir:    d,
-		cursor: cursor,
-		size:   size,
-		val:    val,
-		table:  "quads",
-		isAll:  false,
+		uid:   iterator.NextUID(),
+		qs:    qs,
+		dir:   d,
+		size:  -1,
+		val:   val,
+		table: "quads",
+		isAll: false,
 	}
-	it.makeCursor()
 	return it
 }
 
 func NewAllIterator(qs *QuadStore, table string) *Iterator {
 	var size int64
-	err := qs.db.QueryRow(`SELECT count(*) FROM ?`, table).Scan(&size)
-	if err != nil {
-		glog.Errorln("Error getting size for all iterator from SQL database: %v", err)
-		return nil
-	}
-	var cursor *sql.Rows
 	it := &Iterator{
-		uid:    iterator.NextUID(),
-		qs:     qs,
-		dir:    d,
-		cursor: cursor,
-		size:   size,
-		table:  table,
-		isAll:  true,
+		uid:   iterator.NextUID(),
+		qs:    qs,
+		dir:   quad.Any,
+		size:  size,
+		table: table,
+		isAll: true,
 	}
+	return it
 }
 
 func (it *Iterator) UID() uint64 {
@@ -116,12 +112,13 @@ func (it *Iterator) UID() uint64 {
 
 func (it *Iterator) Reset() {
 	it.Close()
-	it.makeCursor()
 }
 
 func (it *Iterator) Close() {
-	it.cursor.Close()
-	it.cursor = nil
+	if it.cursor != nil {
+		it.cursor.Close()
+		it.cursor = nil
+	}
 }
 
 func (it *Iterator) Tagger() *graph.Tagger {
@@ -154,17 +151,20 @@ func (it *Iterator) SubIterators() []graph.Iterator {
 }
 
 func (it *Iterator) Next() bool {
-	var result quad.Quad
+	graph.NextLogIn(it)
+	if it.cursor == nil {
+		it.makeCursor()
+	}
 	if !it.cursor.Next() {
+		glog.V(4).Infoln("sql: No next")
 		err := it.cursor.Err()
 		if err != nil {
 			glog.Errorf("Cursor error in SQL: %v", err)
 		}
 		it.cursor.Close()
-		it.cursor = nil
 		return false
 	}
-	if table == "nodes" {
+	if it.table == "nodes" {
 		var node string
 		err := it.cursor.Scan(&node)
 		if err != nil {
@@ -175,17 +175,20 @@ func (it *Iterator) Next() bool {
 		return true
 	}
 	var q quad.Quad
-	err := it.iter.Next(&q.Subject, &q.Predicate, &q.Object, &q.Label)
+	err := it.cursor.Scan(&q.Subject, &q.Predicate, &q.Object, &q.Label)
 	if err != nil {
-		glog.Errorf("Error nexting link iterator: %v", err)
+		glog.Errorf("Error scanning sql iterator: %v", err)
 		return false
 	}
 	it.result = q
-	return true
+	return graph.NextLogOut(it, it.result, true)
 }
 
 func (it *Iterator) Contains(v graph.Value) bool {
 	graph.ContainsLogIn(it, v)
+	if it.isAll {
+		return graph.ContainsLogOut(it, v, true)
+	}
 	q := v.(quad.Quad)
 	if q.Get(it.dir) == it.val.(string) {
 		return graph.ContainsLogOut(it, v, true)
@@ -194,6 +197,10 @@ func (it *Iterator) Contains(v graph.Value) bool {
 }
 
 func (it *Iterator) Size() (int64, bool) {
+	if it.size != -1 {
+		return it.size, true
+	}
+	it.size = it.qs.sizeForIterator(it.isAll, it.dir, it.val.(string))
 	return it.size, true
 }
 
@@ -217,7 +224,7 @@ func (it *Iterator) Type() graph.Type {
 	if it.isAll {
 		return graph.All
 	}
-	return mongoType
+	return sqlType
 }
 
 func (it *Iterator) Sorted() bool                     { return true }
@@ -227,7 +234,7 @@ func (it *Iterator) Describe() graph.Description {
 	size, _ := it.Size()
 	return graph.Description{
 		UID:  it.UID(),
-		Name: fmt.Sprintf("%s/%s", it.val.(string), it.dir),
+		Name: fmt.Sprintf("%s/%s", it.val, it.dir),
 		Type: it.Type(),
 		Size: size,
 	}
@@ -235,6 +242,13 @@ func (it *Iterator) Describe() graph.Description {
 
 func (it *Iterator) Stats() graph.IteratorStats {
 	size, _ := it.Size()
+	if it.table == "nodes" {
+		return graph.IteratorStats{
+			ContainsCost: 1,
+			NextCost:     9999,
+			Size:         size,
+		}
+	}
 	return graph.IteratorStats{
 		ContainsCost: 1,
 		NextCost:     5,
