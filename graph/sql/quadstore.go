@@ -99,7 +99,7 @@ func (qs *QuadStore) Quad(val graph.Value) quad.Quad {
 }
 
 func (qs *QuadStore) QuadIterator(d quad.Direction, val graph.Value) graph.Iterator {
-	return NewIterator(qs, "quads", d, val)
+	return NewIterator(qs, d, val)
 }
 
 func (qs *QuadStore) NodesAllIterator() graph.Iterator {
