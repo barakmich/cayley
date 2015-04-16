@@ -36,6 +36,7 @@ type Iterator struct {
 	table  string
 	cursor *sql.Rows
 	result graph.Value
+	err    error
 }
 
 func (it *Iterator) makeCursor() {
@@ -111,14 +112,23 @@ func (it *Iterator) UID() uint64 {
 }
 
 func (it *Iterator) Reset() {
+	it.err = nil
 	it.Close()
 }
 
-func (it *Iterator) Close() {
+func (it *Iterator) Err() error {
+	return it.err
+}
+
+func (it *Iterator) Close() error {
 	if it.cursor != nil {
-		it.cursor.Close()
+		err := it.cursor.Close()
+		if err != nil {
+			return err
+		}
 		it.cursor = nil
 	}
+	return nil
 }
 
 func (it *Iterator) Tagger() *graph.Tagger {
@@ -160,6 +170,7 @@ func (it *Iterator) Next() bool {
 		err := it.cursor.Err()
 		if err != nil {
 			glog.Errorf("Cursor error in SQL: %v", err)
+			it.err = err
 		}
 		it.cursor.Close()
 		return false
@@ -169,6 +180,7 @@ func (it *Iterator) Next() bool {
 		err := it.cursor.Scan(&node)
 		if err != nil {
 			glog.Errorf("Error nexting node iterator: %v", err)
+			it.err = err
 			return false
 		}
 		it.result = node
@@ -178,6 +190,7 @@ func (it *Iterator) Next() bool {
 	err := it.cursor.Scan(&q.Subject, &q.Predicate, &q.Object, &q.Label)
 	if err != nil {
 		glog.Errorf("Error scanning sql iterator: %v", err)
+		it.err = err
 		return false
 	}
 	it.result = q
