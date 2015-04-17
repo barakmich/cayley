@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 
 	"github.com/barakmich/glog"
 	"github.com/google/cayley/graph"
@@ -62,10 +62,8 @@ func createSQLTables(addr string, options graph.Options) error {
 		return err
 	}
 	index, err := tx.Exec(`
-	CREATE INDEX spo_index ON quads (subject, predicate, object);
-	CREATE INDEX pos_index ON quads (predicate, object, subject);
-	CREATE INDEX osp_index ON quads (object, subject, predicate);
-	CREATE INDEX cps_index ON quads (label, predicate, subject);
+	CREATE INDEX pos_index ON quads (predicate, object, subject) WITH (FILLFACTOR = 50);
+	CREATE INDEX osp_index ON quads (object, subject, predicate) WITH (FILLFACTOR = 50);
 	`)
 	if err != nil {
 		glog.Errorf("Cannot create indices: %v", index)
@@ -88,7 +86,36 @@ func newQuadStore(addr string, options graph.Options) (graph.QuadStore, error) {
 	return &qs, nil
 }
 
+func (qs *QuadStore) copyFrom(tx *sql.Tx, in []graph.Delta) error {
+	stmt, err := tx.Prepare(pq.CopyIn("quads", "subject", "predicate", "object", "label", "id", "ts"))
+	if err != nil {
+		return err
+	}
+	for _, d := range in {
+		_, err := stmt.Exec(d.Quad.Subject, d.Quad.Predicate, d.Quad.Object, d.Quad.Label, d.ID.Int(), d.Timestamp)
+		if err != nil {
+			glog.Errorf("couldn't prepare COPY statement: %v", err)
+			return err
+		}
+	}
+	_, err = stmt.Exec()
+	if err != nil {
+		return err
+	}
+	return stmt.Close()
+}
+
 func (qs *QuadStore) buildTxPostgres(tx *sql.Tx, in []graph.Delta) error {
+	allAdds := true
+	for _, d := range in {
+		if d.Action != graph.Add {
+			allAdds = false
+		}
+	}
+	if allAdds {
+		return qs.copyFrom(tx, in)
+	}
+
 	insert, err := tx.Prepare(`INSERT INTO quads(subject, predicate, object, label, id, ts) VALUES ($1, $2, $3, $4, $5, $6)`)
 	if err != nil {
 		glog.Errorf("Cannot prepare insert statement: %v", err)
@@ -137,7 +164,10 @@ func (qs *QuadStore) ApplyDeltas(in []graph.Delta, _ graph.IgnoreOpts) error {
 	}
 	switch qs.sqlFlavor {
 	case "postgres":
-		qs.buildTxPostgres(tx, in)
+		err = qs.buildTxPostgres(tx, in)
+		if err != nil {
+			return err
+		}
 	default:
 		panic("no support for flavor: " + qs.sqlFlavor)
 	}
