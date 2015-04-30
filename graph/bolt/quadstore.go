@@ -441,7 +441,7 @@ func (qs *QuadStore) NameOf(k graph.Value) string {
 	return qs.valueData(k.(*Token)).Name
 }
 
-func (qs *QuadStore) SizeOf(k graph.Value) int64 {
+func (qs *QuadStore) sizeOf(k graph.Value) int64 {
 	if k == nil {
 		return 0
 	}
@@ -477,20 +477,7 @@ func (qs *QuadStore) getMetadata() error {
 }
 
 func (qs *QuadStore) QuadIterator(d quad.Direction, val graph.Value) graph.Iterator {
-	var bucket []byte
-	switch d {
-	case quad.Subject:
-		bucket = spoBucket
-	case quad.Predicate:
-		bucket = posBucket
-	case quad.Object:
-		bucket = ospBucket
-	case quad.Label:
-		bucket = cpsBucket
-	default:
-		panic("unreachable " + d.String())
-	}
-	return NewIterator(bucket, d, val, qs)
+	return NewIterator(graph.LinkageSet{graph.Linkage{d, val}}, qs)
 }
 
 func (qs *QuadStore) NodesAllIterator() graph.Iterator {
@@ -503,7 +490,7 @@ func (qs *QuadStore) QuadsAllIterator() graph.Iterator {
 
 func (qs *QuadStore) QuadDirection(val graph.Value, d quad.Direction) graph.Value {
 	v := val.(*Token)
-	offset := PositionOf(v, d, qs)
+	offset := PositionOf(v, d)
 	if offset != -1 {
 		return &Token{
 			bucket: nodeBucket,

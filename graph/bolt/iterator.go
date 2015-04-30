@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/barakmich/glog"
 	"github.com/boltdb/bolt"
@@ -39,37 +40,94 @@ func init() {
 }
 
 type Iterator struct {
-	uid     uint64
-	tags    graph.Tagger
-	bucket  []byte
-	checkID []byte
-	dir     quad.Direction
-	qs      *QuadStore
-	result  *Token
-	buffer  [][]byte
-	offset  int
-	done    bool
-	size    int64
-	err     error
+	uid       uint64
+	tags      graph.Tagger
+	bucket    []byte
+	prefix    []byte
+	lset      graph.LinkageSet
+	nextCheck graph.LinkageSet
+	qs        *QuadStore
+	result    *Token
+	buffer    [][]byte
+	offset    int
+	done      bool
+	size      int64
+	err       error
 }
 
-func NewIterator(bucket []byte, d quad.Direction, value graph.Value, qs *QuadStore) *Iterator {
-	tok := value.(*Token)
-	if !bytes.Equal(tok.bucket, nodeBucket) {
-		glog.Error("creating an iterator from a non-node value")
-		return &Iterator{done: true}
+func (it *Iterator) determineBucket() {
+	sort.Sort(it.lset)
+	switch len(it.lset) {
+	case 1:
+		it.determineSingleBucket()
+		return
+	case 2:
+		it.determineIndexBucket()
+		return
 	}
+	panic("unsupported number of linkages for Bolt iterator:" + string(len(it.lset)))
+}
+
+func (it *Iterator) determineIndexBucket() {
+	it.prefix = nil
+	it.nextCheck = nil
+	d1, d2 := it.lset[0], it.lset[1]
+	prefix := fmt.Sprint(d1.Dir.Prefix(), d2.Dir.Prefix())
+	switch prefix {
+	case "sp":
+		it.bucket = spoBucket
+	case "so":
+		d1, d2 = d2, d1
+		it.bucket = ospBucket
+	case "sc":
+		it.nextCheck = append(it.nextCheck, d2)
+		it.determineSingleBucket()
+		return
+	case "po":
+		it.bucket = posBucket
+	case "pc":
+		d1, d2 = d2, d1
+		it.bucket = cpsBucket
+	case "oc":
+		it.nextCheck = append(it.nextCheck, d2)
+		it.determineSingleBucket()
+		return
+	default:
+		panic("unreachable -- no prefix " + prefix)
+	}
+	it.prefix = append(it.prefix, d1.Value.(*Token).key...)
+	it.prefix = append(it.prefix, d2.Value.(*Token).key...)
+}
+
+func (it *Iterator) determineSingleBucket() {
+	var bucket []byte
+	l := it.lset[0]
+	switch l.Dir {
+	case quad.Subject:
+		bucket = spoBucket
+	case quad.Predicate:
+		bucket = posBucket
+	case quad.Object:
+		bucket = ospBucket
+	case quad.Label:
+		bucket = cpsBucket
+	default:
+		panic("unreachable " + l.Dir.String())
+	}
+	it.bucket = bucket
+	tok := l.Value.(*Token)
+	it.prefix = tok.key
+}
+
+func NewIterator(lset graph.LinkageSet, qs *QuadStore) *Iterator {
 
 	it := Iterator{
-		uid:    iterator.NextUID(),
-		bucket: bucket,
-		dir:    d,
-		qs:     qs,
-		size:   qs.SizeOf(value),
+		uid:  iterator.NextUID(),
+		qs:   qs,
+		lset: lset,
+		size: qs.sizeOf(lset[0].Value.(*Token)),
 	}
-
-	it.checkID = make([]byte, len(tok.key))
-	copy(it.checkID, tok.key)
+	it.determineBucket()
 
 	return &it
 }
@@ -101,7 +159,7 @@ func (it *Iterator) TagResults(dst map[string]graph.Value) {
 }
 
 func (it *Iterator) Clone() graph.Iterator {
-	out := NewIterator(it.bucket, it.dir, &Token{nodeBucket, it.checkID}, it.qs)
+	out := NewIterator(it.lset, it.qs)
 	out.Tagger().CopyFrom(it)
 	return out
 }
@@ -117,6 +175,16 @@ func (it *Iterator) isLiveValue(val []byte) bool {
 	var entry IndexEntry
 	json.Unmarshal(val, &entry)
 	return len(entry.History)%2 != 0
+}
+
+func (it *Iterator) matchesNextConstraint(key []byte) bool {
+	for _, l := range it.nextCheck {
+		offset := PositionOf(&Token{it.bucket, key}, l.Dir)
+		if len(key) == 0 || !bytes.HasPrefix(key[offset:], l.Value.(*Token).key) {
+			return false
+		}
+	}
+	return true
 }
 
 func (it *Iterator) Next() bool {
@@ -135,13 +203,15 @@ func (it *Iterator) Next() bool {
 			b := tx.Bucket(it.bucket)
 			cur := b.Cursor()
 			if last == nil {
-				k, _ := cur.Seek(it.checkID)
-				if bytes.HasPrefix(k, it.checkID) {
-					var out []byte
-					out = make([]byte, len(k))
-					copy(out, k)
-					it.buffer = append(it.buffer, out)
-					i++
+				k, v := cur.Seek(it.prefix)
+				if bytes.HasPrefix(k, it.prefix) {
+					if it.isLiveValue(v) && it.matchesNextConstraint(k) {
+						var out []byte
+						out = make([]byte, len(k))
+						copy(out, k)
+						it.buffer = append(it.buffer, out)
+						i++
+					}
 				} else {
 					it.buffer = append(it.buffer, nil)
 					return errNotExist
@@ -154,11 +224,11 @@ func (it *Iterator) Next() bool {
 			}
 			for i < bufferSize {
 				k, v := cur.Next()
-				if k == nil || !bytes.HasPrefix(k, it.checkID) {
+				if k == nil || !bytes.HasPrefix(k, it.prefix) {
 					it.buffer = append(it.buffer, nil)
 					break
 				}
-				if !it.isLiveValue(v) {
+				if !it.isLiveValue(v) || !it.matchesNextConstraint(k) {
 					continue
 				}
 				var out []byte
@@ -220,7 +290,7 @@ func (it *Iterator) SubIterators() []graph.Iterator {
 	return nil
 }
 
-func PositionOf(tok *Token, d quad.Direction, qs *QuadStore) int {
+func PositionOf(tok *Token, d quad.Direction) int {
 	if bytes.Equal(tok.bucket, spoBucket) {
 		switch d {
 		case quad.Subject:
@@ -277,20 +347,22 @@ func (it *Iterator) Contains(v graph.Value) bool {
 	if bytes.Equal(val.bucket, nodeBucket) {
 		return false
 	}
-	offset := PositionOf(val, it.dir, it.qs)
-	if len(val.key) != 0 && bytes.HasPrefix(val.key[offset:], it.checkID) {
-		// You may ask, why don't we check to see if it's a valid (not deleted) quad
-		// again?
-		//
-		// We've already done that -- in order to get the graph.Value token in the
-		// first place, we had to have done the check already; it came from a Next().
-		//
-		// However, if it ever starts coming from somewhere else, it'll be more
-		// efficient to change the interface of the graph.Value for LevelDB to a
-		// struct with a flag for isValid, to save another random read.
-		return true
+	for _, l := range it.lset {
+		offset := PositionOf(val, l.Dir)
+		if len(val.key) == 0 || !bytes.HasPrefix(val.key[offset:], l.Value.(*Token).key) {
+			// You may ask, why don't we check to see if it's a valid (not deleted) quad
+			// again?
+			//
+			// We've already done that -- in order to get the graph.Value token in the
+			// first place, we had to have done the check already; it came from a Next().
+			//
+			// However, if it ever starts coming from somewhere else, it'll be more
+			// efficient to change the interface of the graph.Value for LevelDB to a
+			// struct with a flag for isValid, to save another random read.
+			return false
+		}
 	}
-	return false
+	return true
 }
 
 func (it *Iterator) Size() (int64, bool) {
@@ -300,11 +372,11 @@ func (it *Iterator) Size() (int64, bool) {
 func (it *Iterator) Describe() graph.Description {
 	return graph.Description{
 		UID:       it.UID(),
-		Name:      it.qs.NameOf(&Token{it.bucket, it.checkID}),
+		Name:      it.qs.NameOf(&Token{it.bucket, it.lset[0].Value.(*Token).key}),
 		Type:      it.Type(),
 		Tags:      it.tags.Tags(),
 		Size:      it.size,
-		Direction: it.dir,
+		Direction: it.lset[0].Dir,
 	}
 }
 

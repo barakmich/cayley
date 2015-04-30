@@ -38,7 +38,7 @@ type Tagger struct {
 // Linkage is a union type representing a set of values established for a given
 // quad direction.
 type Linkage struct {
-	Dir    quad.Direction
+	Dir   quad.Direction
 	Value Value
 }
 
@@ -46,6 +46,9 @@ type Linkage struct {
 type LinkageSet []Linkage
 
 // TODO(barakmich): Helper functions as needed, eg, ValuesForDirection(quad.Direction) []Value
+func (s LinkageSet) Len() int           { return len(s) }
+func (s LinkageSet) Less(i, j int) bool { return s[i].Dir < s[j].Dir }
+func (s LinkageSet) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
 // Add a tag to the iterator.
 func (t *Tagger) Add(tag string) {
