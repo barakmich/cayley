@@ -179,7 +179,7 @@ func (it *Iterator) isLiveValue(val []byte) bool {
 
 func (it *Iterator) matchesNextConstraint(key []byte) bool {
 	for _, l := range it.nextCheck {
-		offset := PositionOf(&Token{it.bucket, key}, l.Dir)
+		offset := PositionOf(Token{it.bucket, key}, l.Dir)
 		if len(key) == 0 || !bytes.HasPrefix(key[offset:], l.Value.(*Token).key) {
 			return false
 		}
@@ -290,7 +290,7 @@ func (it *Iterator) SubIterators() []graph.Iterator {
 	return nil
 }
 
-func PositionOf(tok *Token, d quad.Direction) int {
+func PositionOf(tok Token, d quad.Direction) int {
 	if bytes.Equal(tok.bucket, spoBucket) {
 		switch d {
 		case quad.Subject:
@@ -348,7 +348,7 @@ func (it *Iterator) Contains(v graph.Value) bool {
 		return false
 	}
 	for _, l := range it.lset {
-		offset := PositionOf(val, l.Dir)
+		offset := PositionOf(*val, l.Dir)
 		if len(val.key) == 0 || !bytes.HasPrefix(val.key[offset:], l.Value.(*Token).key) {
 			// You may ask, why don't we check to see if it's a valid (not deleted) quad
 			// again?

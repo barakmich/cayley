@@ -490,7 +490,7 @@ func (qs *QuadStore) QuadsAllIterator() graph.Iterator {
 
 func (qs *QuadStore) QuadDirection(val graph.Value, d quad.Direction) graph.Value {
 	v := val.(*Token)
-	offset := PositionOf(v, d)
+	offset := PositionOf(*v, d)
 	if offset != -1 {
 		return &Token{
 			bucket: nodeBucket,
