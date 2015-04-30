@@ -39,8 +39,13 @@ type Tagger struct {
 // quad direction.
 type Linkage struct {
 	Dir    quad.Direction
-	Values []Value
+	Value Value
 }
+
+// LinkageSet is an array of Linkages with some helpful functions for aggregation.
+type LinkageSet []Linkage
+
+// TODO(barakmich): Helper functions as needed, eg, ValuesForDirection(quad.Direction) []Value
 
 // Add a tag to the iterator.
 func (t *Tagger) Add(tag string) {
