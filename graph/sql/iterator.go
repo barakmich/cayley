@@ -239,7 +239,7 @@ func (it *Iterator) Type() graph.Type {
 	return sqlType
 }
 
-func (it *Iterator) Sorted() bool                     { return true }
+func (it *Iterator) Sorted() bool                     { return false }
 func (it *Iterator) Optimize() (graph.Iterator, bool) { return it, false }
 
 func (it *Iterator) Describe() graph.Description {
