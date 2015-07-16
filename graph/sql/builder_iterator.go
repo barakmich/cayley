@@ -243,6 +243,7 @@ type StatementIterator struct {
 	resultNext  [][]string
 	cols        []string
 	resultQuad  quad.Quad
+	size        int64
 }
 
 func (it *StatementIterator) Clone() graph.Iterator {
@@ -252,6 +253,7 @@ func (it *StatementIterator) Clone() graph.Iterator {
 		buildWhere: it.buildWhere,
 		where:      it.where,
 		stType:     it.stType,
+		size:       it.size,
 	}
 	copy(it.tags, m.tags)
 	m.tagger.CopyFrom(it)
@@ -269,6 +271,7 @@ func NewStatementIterator(qs *QuadStore, d quad.Direction, val string) *Statemen
 			},
 		},
 		stType: link,
+		size:   -1,
 	}
 	return it
 }
@@ -328,8 +331,33 @@ func (it *StatementIterator) Type() graph.Type {
 	return sqlBuilderType
 }
 
+func (it *StatementIterator) preFilter(v graph.Value) bool {
+	if it.stType == link {
+		q := v.(quad.Quad)
+		for _, b := range it.buildWhere {
+			if len(b.strTarget) == 0 {
+				continue
+			}
+			canFilter := true
+			for _, s := range b.strTarget {
+				if q.Get(b.pair.dir) == s {
+					canFilter = false
+					break
+				}
+			}
+			if canFilter {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (it *StatementIterator) Contains(v graph.Value) bool {
 	var err error
+	if it.preFilter(v) {
+		return false
+	}
 	q, values := it.buildQuery(true, v)
 	ivalues := make([]interface{}, 0, len(values))
 	for _, v := range values {
@@ -380,22 +408,35 @@ func (it *StatementIterator) SubIterators() []graph.Iterator {
 func (it *StatementIterator) Sorted() bool                     { return false }
 func (it *StatementIterator) Optimize() (graph.Iterator, bool) { return it, false }
 
-func (it *StatementIterator) Size() (int64, bool) { return 1, false }
+func (it *StatementIterator) Size() (int64, bool) {
+
+	if it.size != -1 {
+		return it.size, true
+	}
+	if it.stType == node {
+		return it.qs.Size(), true
+	}
+	b := it.buildWhere[0]
+	it.size = it.qs.sizeForIterator(false, b.pair.dir, b.strTarget[0])
+	return it.size, true
+}
 
 func (it *StatementIterator) Describe() graph.Description {
+	size, _ := it.Size()
 	return graph.Description{
 		UID:  it.UID(),
 		Name: "SQL_QUERY",
 		Type: it.Type(),
-		Size: 1,
+		Size: size,
 	}
 }
 
 func (it *StatementIterator) Stats() graph.IteratorStats {
+	size, _ := it.Size()
 	return graph.IteratorStats{
-		ContainsCost: 100,
+		ContainsCost: 1,
 		NextCost:     5,
-		Size:         1,
+		Size:         size,
 	}
 }
 
@@ -418,7 +459,7 @@ func (it *StatementIterator) makeCursor() {
 
 func (it *StatementIterator) NextPath() bool {
 	it.resultIndex += 1
-	if it.resultIndex == len(it.resultList) {
+	if it.resultIndex >= len(it.resultList) {
 		return false
 	}
 	it.buildResult(it.resultIndex)
@@ -496,6 +537,9 @@ func (it *StatementIterator) Next() bool {
 			}
 		}
 
+	}
+	if len(it.resultList) == 0 {
+		return graph.NextLogOut(it, nil, false)
 	}
 	it.buildResult(0)
 	return graph.NextLogOut(it, it.result, true)

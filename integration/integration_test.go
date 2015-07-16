@@ -534,6 +534,7 @@ func checkQueries(t *testing.T) {
 		if testing.Short() && test.long {
 			continue
 		}
+		fmt.Printf("Now testing %s\n", test.message)
 		ses := gremlin.NewSession(handle.QuadStore, cfg.Timeout, true)
 		_, err := ses.Parse(test.query)
 		if err != nil {
