@@ -124,9 +124,15 @@ const (
 )
 
 func (it *StatementIterator) canonicalizeWhere() (string, []string) {
-	b := it.buildWhere
-	b.pair.table = fmt.Sprintf("t_%d", it.uid)
-	return b.toSQL()
+	var out []string
+	var values []string
+	for _, b := range it.buildWhere {
+		b.pair.table = it.tableName()
+		s, v := b.toSQL()
+		values = append(values, v...)
+		out = append(out, s)
+	}
+	return strings.Join(out, " AND "), values
 }
 
 func (it *StatementIterator) getTables() map[string]bool {
@@ -142,40 +148,81 @@ func (it *StatementIterator) getTables() map[string]bool {
 	return m
 }
 
-func (it *StatementIterator) buildQuery() (string, []string) {
+func (it *StatementIterator) tableName() string {
+	return fmt.Sprintf("t_%d", it.uid)
+}
+
+func (it *StatementIterator) buildQuery(contains bool, v graph.Value) (string, []string) {
 	str := "SELECT "
 	var t []string
-	if it.stType == link {
-		t = []string{
-			fmt.Sprintf("t_%d.subject", it.uid),
-			fmt.Sprintf("t_%d.predicate", it.uid),
-			fmt.Sprintf("t_%d.object", it.uid),
-			fmt.Sprintf("t_%d.label", it.uid),
+	if !contains {
+		if it.stType == link {
+			t = []string{
+				fmt.Sprintf("%s.subject", it.tableName()),
+				fmt.Sprintf("%s.predicate", it.tableName()),
+				fmt.Sprintf("%s.object", it.tableName()),
+				fmt.Sprintf("%s.label", it.tableName()),
+			}
+		} else {
+			t = []string{fmt.Sprintf("%s.%s as __execd", it.tableName(), it.dir)}
+		}
+		for _, v := range it.tags {
+			t = append(t, fmt.Sprintf("%s as %s", v.pair, v.t))
 		}
 	} else {
-		t = []string{fmt.Sprintf("t_%d.%s as __execd", it.uid, it.dir)}
-	}
-	for _, v := range it.tags {
-		t = append(t, fmt.Sprintf("%s as %s", v.pair, v.t))
+		t = append(t, "COUNT(*)")
 	}
 	str += strings.Join(t, ", ")
 	str += " FROM "
-	t = []string{fmt.Sprintf("quads as t_%d", it.uid)}
+	t = []string{fmt.Sprintf("quads as %s", it.tableName())}
 	for k, _ := range it.getTables() {
-		t = append(t, fmt.Sprintf("quads as %s", k))
+		if k != it.tableName() {
+			t = append(t, fmt.Sprintf("quads as %s", k))
+		}
 	}
 	str += strings.Join(t, ", ")
 	str += " WHERE "
-	s, values := it.canonicalizeWhere()
-	str += s
+	var values []string
+	var s string
+	if it.stType != node {
+		s, values = it.canonicalizeWhere()
+	}
 	if it.where != nil {
-		s += " AND "
+		if s != "" {
+			s += " AND "
+		}
 		where, v2 := it.where.toSQL()
 		s += where
 		values = append(values, v2...)
 	}
-	if it.stType == node {
-		str += " ORDER BY __execd"
+	str += s
+	if contains {
+		if it.stType == link {
+			q := v.(quad.Quad)
+			str += " AND "
+			t = []string{
+				fmt.Sprintf("%s.subject = ?", it.tableName()),
+				fmt.Sprintf("%s.predicate = ?", it.tableName()),
+				fmt.Sprintf("%s.object = ?", it.tableName()),
+				fmt.Sprintf("%s.label = ?", it.tableName()),
+			}
+			str += " " + strings.Join(t, " AND ") + " "
+			values = append(values, q.Subject)
+			values = append(values, q.Predicate)
+			values = append(values, q.Object)
+			values = append(values, q.Label)
+		} else {
+			str += fmt.Sprintf(" AND %s.%s = ? ", it.tableName(), it.dir)
+			values = append(values, v.(string))
+		}
+
+	}
+	if contains {
+		str += " LIMIT 1 "
+	} else {
+		if it.stType == node {
+			str += " ORDER BY __execd "
+		}
 	}
 	str += ";"
 	for i := 1; i <= len(values); i++ {
@@ -185,18 +232,25 @@ func (it *StatementIterator) buildQuery() (string, []string) {
 }
 
 type StatementIterator struct {
-	uid        uint64
-	qs         *QuadStore
-	buildWhere baseClause
-	where      clause
-	tagger     graph.Tagger
-	tags       []tag
-	err        error
-	cursor     *sql.Rows
-	stType     statementType
-	dir        quad.Direction
-	result     map[string]string
-	resultQuad quad.Quad
+	uid uint64
+	qs  *QuadStore
+
+	// Only for links
+	buildWhere []baseClause
+
+	where       clause
+	tagger      graph.Tagger
+	tags        []tag
+	err         error
+	cursor      *sql.Rows
+	stType      statementType
+	dir         quad.Direction
+	result      map[string]string
+	resultIndex int
+	resultList  [][]string
+	resultNext  [][]string
+	cols        []string
+	resultQuad  quad.Quad
 }
 
 func (it *StatementIterator) Clone() graph.Iterator {
@@ -216,9 +270,11 @@ func NewStatementIterator(qs *QuadStore, d quad.Direction, val string) *Statemen
 	it := &StatementIterator{
 		uid: iterator.NextUID(),
 		qs:  qs,
-		buildWhere: baseClause{
-			pair:      tableDir{"", d},
-			strTarget: []string{val},
+		buildWhere: []baseClause{
+			baseClause{
+				pair:      tableDir{"", d},
+				strTarget: []string{val},
+			},
 		},
 		stType: link,
 	}
@@ -266,6 +322,12 @@ func (it *StatementIterator) NextPath() bool {
 
 func (it *StatementIterator) TagResults(dst map[string]graph.Value) {
 	for tag, value := range it.result {
+		if tag == "__execd" {
+			for _, tag := range it.tagger.Tags() {
+				dst[tag] = value
+			}
+			continue
+		}
 		dst[tag] = value
 	}
 
@@ -279,7 +341,19 @@ func (it *StatementIterator) Type() graph.Type {
 }
 
 func (it *StatementIterator) Contains(v graph.Value) bool {
-	return false
+	q, values := it.buildQuery(true, v)
+	ivalues := make([]interface{}, 0, len(values))
+	for _, v := range values {
+		ivalues = append(ivalues, v)
+	}
+	var count int
+	err := it.qs.db.QueryRow(q, ivalues...).Scan(&count)
+	if err != nil {
+		it.err = err
+		glog.Errorln("Error querying Contains for value %s", v)
+		return false
+	}
+	return count != 0
 }
 
 func (it *StatementIterator) SubIterators() []graph.Iterator {
@@ -302,7 +376,7 @@ func (it *StatementIterator) Describe() graph.Description {
 
 func (it *StatementIterator) Stats() graph.IteratorStats {
 	return graph.IteratorStats{
-		ContainsCost: 10,
+		ContainsCost: 100,
 		NextCost:     5,
 		Size:         1,
 	}
@@ -312,7 +386,7 @@ func (it *StatementIterator) makeCursor() {
 	if it.cursor != nil {
 		it.cursor.Close()
 	}
-	q, values := it.buildQuery()
+	q, values := it.buildQuery(false, nil)
 	ivalues := make([]interface{}, 0, len(values))
 	for _, v := range values {
 		ivalues = append(ivalues, v)
@@ -324,45 +398,115 @@ func (it *StatementIterator) makeCursor() {
 	}
 	it.cursor = cursor
 }
+
+func (it *StatementIterator) NextResult() bool {
+	it.resultIndex += 1
+	if it.resultIndex == len(it.resultList) {
+		return false
+	}
+	it.buildResult(it.resultIndex)
+	return true
+}
+
 func (it *StatementIterator) Next() bool {
+	var err error
 	graph.NextLogIn(it)
 	if it.cursor == nil {
 		it.makeCursor()
-	}
-	if !it.cursor.Next() {
-		glog.V(4).Infoln("sql: No next")
-		err := it.cursor.Err()
+		it.cols, err = it.cursor.Columns()
 		if err != nil {
-			glog.Errorf("Cursor error in SQL: %v", err)
+			glog.Errorf("Couldn't get columns")
 			it.err = err
+			it.cursor.Close()
+			return false
 		}
-		it.cursor.Close()
+		// iterate the first one
+		if !it.cursor.Next() {
+			glog.V(4).Infoln("sql: No next")
+			err := it.cursor.Err()
+			if err != nil {
+				glog.Errorf("Cursor error in SQL: %v", err)
+				it.err = err
+			}
+			it.cursor.Close()
+			return false
+		}
+		s, err := it.scan()
+		if err != nil {
+			it.err = err
+			it.cursor.Close()
+			return false
+		}
+		it.resultNext = append(it.resultNext, s)
+	}
+	if it.resultList != nil && it.resultNext == nil {
+		// We're on something and there's no next
 		return false
 	}
-	cols, err := it.cursor.Columns()
-	if err != nil {
-		glog.Errorf("Couldn't get columns")
-		it.err = err
-		it.cursor.Close()
-		return false
+	it.resultList = it.resultNext
+	it.resultNext = nil
+	it.resultIndex = 0
+	for {
+		if !it.cursor.Next() {
+			glog.V(4).Infoln("sql: No next")
+			err := it.cursor.Err()
+			if err != nil {
+				glog.Errorf("Cursor error in SQL: %v", err)
+				it.err = err
+			}
+			it.cursor.Close()
+			break
+		}
+		s, err := it.scan()
+		if err != nil {
+			it.err = err
+			it.cursor.Close()
+			return false
+		}
+		if it.stType == node {
+			if it.resultList[0][0] != s[0] {
+				it.resultNext = append(it.resultNext, s)
+				break
+			} else {
+				it.resultList = append(it.resultList, s)
+			}
+		} else {
+			if it.resultList[0][0] == s[0] && it.resultList[0][1] == s[1] && it.resultList[0][2] == s[2] && it.resultList[0][3] == s[3] {
+				it.resultList = append(it.resultList, s)
+			} else {
+				it.resultNext = append(it.resultNext, s)
+				break
+			}
+		}
+
 	}
-	pointers := make([]interface{}, len(cols))
-	container := make([]string, len(cols))
+	it.buildResult(0)
+	return graph.NextLogOut(it, it.result, true)
+}
+
+func (it *StatementIterator) scan() ([]string, error) {
+	pointers := make([]interface{}, len(it.cols))
+	container := make([]string, len(it.cols))
 	for i, _ := range pointers {
 		pointers[i] = &container[i]
 	}
-	err = it.cursor.Scan(pointers...)
+	err := it.cursor.Scan(pointers...)
 	if err != nil {
-		glog.Errorf("Error nexting iterator: %v", err)
+		glog.Errorf("Error scanning iterator: %v", err)
 		it.err = err
-		return false
+		return nil, err
 	}
+	return container, nil
+}
+
+func (it *StatementIterator) buildResult(i int) {
+	container := it.resultList[i]
 	if it.stType == node {
 		it.result = make(map[string]string)
-		for i, c := range cols {
+		for i, c := range it.cols {
 			it.result[c] = container[i]
 		}
-		return true
+		return
 	}
 	var q quad.Quad
 	q.Subject = container[0]
@@ -371,8 +515,7 @@ func (it *StatementIterator) Next() bool {
 	q.Label = container[3]
 	it.resultQuad = q
 	it.result = make(map[string]string)
-	for i, c := range cols[4:] {
+	for i, c := range it.cols[4:] {
 		it.result[c] = container[i+4]
 	}
-	return graph.NextLogOut(it, it.result, true)
 }
