@@ -155,22 +155,18 @@ func (it *StatementIterator) tableName() string {
 func (it *StatementIterator) buildQuery(contains bool, v graph.Value) (string, []string) {
 	str := "SELECT "
 	var t []string
-	if !contains {
-		if it.stType == link {
-			t = []string{
-				fmt.Sprintf("%s.subject", it.tableName()),
-				fmt.Sprintf("%s.predicate", it.tableName()),
-				fmt.Sprintf("%s.object", it.tableName()),
-				fmt.Sprintf("%s.label", it.tableName()),
-			}
-		} else {
-			t = []string{fmt.Sprintf("%s.%s as __execd", it.tableName(), it.dir)}
-		}
-		for _, v := range it.tags {
-			t = append(t, fmt.Sprintf("%s as %s", v.pair, v.t))
+	if it.stType == link {
+		t = []string{
+			fmt.Sprintf("%s.subject", it.tableName()),
+			fmt.Sprintf("%s.predicate", it.tableName()),
+			fmt.Sprintf("%s.object", it.tableName()),
+			fmt.Sprintf("%s.label", it.tableName()),
 		}
 	} else {
-		t = append(t, "COUNT(*)")
+		t = []string{fmt.Sprintf("%s.%s as __execd", it.tableName(), it.dir)}
+	}
+	for _, v := range it.tags {
+		t = append(t, fmt.Sprintf("%s as %s", v.pair, v.t))
 	}
 	str += strings.Join(t, ", ")
 	str += " FROM "
@@ -217,12 +213,8 @@ func (it *StatementIterator) buildQuery(contains bool, v graph.Value) (string, [
 		}
 
 	}
-	if contains {
-		str += " LIMIT 1 "
-	} else {
-		if it.stType == node {
-			str += " ORDER BY __execd "
-		}
+	if it.stType == node {
+		str += " ORDER BY __execd "
 	}
 	str += ";"
 	for i := 1; i <= len(values); i++ {
@@ -316,10 +308,6 @@ func (it *StatementIterator) Result() graph.Value {
 	return it.resultQuad
 }
 
-func (it *StatementIterator) NextPath() bool {
-	return false
-}
-
 func (it *StatementIterator) TagResults(dst map[string]graph.Value) {
 	for tag, value := range it.result {
 		if tag == "__execd" {
@@ -341,19 +329,48 @@ func (it *StatementIterator) Type() graph.Type {
 }
 
 func (it *StatementIterator) Contains(v graph.Value) bool {
+	var err error
 	q, values := it.buildQuery(true, v)
 	ivalues := make([]interface{}, 0, len(values))
 	for _, v := range values {
 		ivalues = append(ivalues, v)
 	}
-	var count int
-	err := it.qs.db.QueryRow(q, ivalues...).Scan(&count)
+	it.cursor, err = it.qs.db.Query(q, ivalues...)
+	it.cols, err = it.cursor.Columns()
 	if err != nil {
+		glog.Errorf("Couldn't get columns")
 		it.err = err
-		glog.Errorln("Error querying Contains for value %s", v)
+		it.cursor.Close()
 		return false
 	}
-	return count != 0
+	it.resultList = nil
+	for {
+		if !it.cursor.Next() {
+			glog.V(4).Infoln("sql: No next")
+			err := it.cursor.Err()
+			if err != nil {
+				glog.Errorf("Cursor error in SQL: %v", err)
+				it.err = err
+			}
+			it.cursor.Close()
+			break
+		}
+		s, err := it.scan()
+		if err != nil {
+			it.err = err
+			it.cursor.Close()
+			return false
+		}
+		it.resultList = append(it.resultList, s)
+	}
+	it.cursor.Close()
+	it.cursor = nil
+	if len(it.resultList) != 0 {
+		it.resultIndex = 0
+		it.buildResult(0)
+		return true
+	}
+	return false
 }
 
 func (it *StatementIterator) SubIterators() []graph.Iterator {
@@ -399,7 +416,7 @@ func (it *StatementIterator) makeCursor() {
 	it.cursor = cursor
 }
 
-func (it *StatementIterator) NextResult() bool {
+func (it *StatementIterator) NextPath() bool {
 	it.resultIndex += 1
 	if it.resultIndex == len(it.resultList) {
 		return false
