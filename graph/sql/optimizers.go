@@ -65,7 +65,6 @@ func intersect(a *StatementIterator, b *StatementIterator) (*StatementIterator, 
 }
 
 func hasa(a *StatementIterator, d quad.Direction) (*StatementIterator, error) {
-	glog.Infoln("wat", d)
 	if a.stType != link {
 		return nil, errors.New("Can't take the HASA of a link SQL iterator")
 	}
@@ -83,6 +82,15 @@ func hasa(a *StatementIterator, d quad.Direction) (*StatementIterator, error) {
 		where = wherenew
 	}
 	out.where = where
+	//out := &StatementIterator{
+	//uid:        iterator.NextUID(),
+	//qs:         a.qs,
+	//stType:     node,
+	//dir:        d,
+	//buildWhere: a.buildWhere,
+	//where:      a.where,
+	//size:       -1,
+	//}
 	for k, v := range a.tagger.Fixed() {
 		out.tagger.AddFixed(k, v)
 	}
@@ -109,6 +117,7 @@ func linksto(a *StatementIterator, d quad.Direction) (*StatementIterator, error)
 		qs:     a.qs,
 		stType: link,
 		dir:    d,
+		size:   -1,
 	}
 	where := a.where
 	for _, w := range a.buildWhere {
@@ -116,6 +125,7 @@ func linksto(a *StatementIterator, d quad.Direction) (*StatementIterator, error)
 		wherenew := joinClause{where, w, andClause}
 		where = wherenew
 	}
+
 	out.where = where
 	out.buildWhere = []baseClause{
 		baseClause{
@@ -141,7 +151,13 @@ func linksto(a *StatementIterator, d quad.Direction) (*StatementIterator, error)
 	for k, v := range a.tagger.Fixed() {
 		out.tagger.AddFixed(k, v)
 	}
-	out.tags = append(tags, a.tags...)
+	for _, t := range a.tags {
+		if t.pair.table == "" {
+			t.pair.table = a.tableName()
+		}
+		tags = append(tags, t)
+	}
+	out.tags = tags
 	return out, nil
 }
 
@@ -188,6 +204,25 @@ func (qs *QuadStore) optimizeLinksTo(it *iterator.LinksTo) (graph.Iterator, bool
 		}
 		newit.Tagger().CopyFrom(it)
 		return newit, true
+	case graph.All:
+		newit := &StatementIterator{
+			uid:    iterator.NextUID(),
+			qs:     qs,
+			stType: link,
+			size:   qs.Size(),
+		}
+		for _, t := range primary.Tagger().Tags() {
+			newit.tags = append(newit.tags, tag{
+				pair: tableDir{"", it.Direction()},
+				t:    t,
+			})
+		}
+		for k, v := range primary.Tagger().Fixed() {
+			newit.tagger.AddFixed(k, v)
+		}
+		newit.tagger.CopyFrom(it)
+
+		return newit, true
 	}
 	return it, false
 }
@@ -230,7 +265,7 @@ func (qs *QuadStore) optimizeAnd(it *iterator.And) (graph.Iterator, bool) {
 	for _, i := range unusedIts {
 		newAnd.AddSubIterator(i)
 	}
-	return newAnd, true
+	return newAnd.Optimize()
 }
 
 func (qs *QuadStore) optimizeHasA(it *iterator.HasA) (graph.Iterator, bool) {

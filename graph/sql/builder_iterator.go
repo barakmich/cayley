@@ -46,6 +46,7 @@ func (td tableDir) String() string {
 type clause interface {
 	toSQL() (string, []string)
 	getTables() map[string]bool
+	size() int
 }
 
 type baseClause struct {
@@ -65,6 +66,8 @@ func (b baseClause) toSQL() (string, []string) {
 	return fmt.Sprintf("%s = ?", b.pair), []string{b.strTarget[0]}
 }
 
+func (b baseClause) size() int { return 1 }
+
 func (b baseClause) getTables() map[string]bool {
 	out := make(map[string]bool)
 	if b.pair.table != "" {
@@ -80,6 +83,17 @@ type joinClause struct {
 	left  clause
 	right clause
 	op    clauseOp
+}
+
+func (jc joinClause) size() int {
+	size := 0
+	if jc.left != nil {
+		size += jc.left.size()
+	}
+	if jc.right != nil {
+		size += jc.right.size()
+	}
+	return size
 }
 
 func (jc joinClause) toSQL() (string, []string) {
@@ -182,6 +196,9 @@ func (it *StatementIterator) buildQuery(contains bool, v graph.Value) (string, [
 		t = []string{fmt.Sprintf("%s.%s as __execd", it.tableName(), it.dir)}
 	}
 	for _, v := range it.tags {
+		if v.pair.table == "" {
+			v.pair.table = it.tableName()
+		}
 		t = append(t, fmt.Sprintf("%s as %s", v.pair, v.t))
 	}
 	for _, v := range it.tagger.Tags() {
@@ -199,7 +216,7 @@ func (it *StatementIterator) buildQuery(contains bool, v graph.Value) (string, [
 	str += " WHERE "
 	var values []string
 	var s string
-	if it.stType != node {
+	if len(it.buildWhere) != 0 {
 		s, values = it.canonicalizeWhere()
 	}
 	if it.where != nil {
@@ -210,28 +227,31 @@ func (it *StatementIterator) buildQuery(contains bool, v graph.Value) (string, [
 		s += where
 		values = append(values, v2...)
 	}
-	str += s
+
 	if contains {
+		if s != "" {
+			s += " AND "
+		}
 		if it.stType == link {
 			q := v.(quad.Quad)
-			str += " AND "
 			t = []string{
 				fmt.Sprintf("%s.subject = ?", it.tableName()),
 				fmt.Sprintf("%s.predicate = ?", it.tableName()),
 				fmt.Sprintf("%s.object = ?", it.tableName()),
 				fmt.Sprintf("%s.label = ?", it.tableName()),
 			}
-			str += " " + strings.Join(t, " AND ") + " "
+			s += " " + strings.Join(t, " AND ") + " "
 			values = append(values, q.Subject)
 			values = append(values, q.Predicate)
 			values = append(values, q.Object)
 			values = append(values, q.Label)
 		} else {
-			str += fmt.Sprintf(" AND %s.%s = ? ", it.tableName(), it.dir)
+			s += fmt.Sprintf("%s.%s = ? ", it.tableName(), it.dir)
 			values = append(values, v.(string))
 		}
 
 	}
+	str += s
 	if it.stType == node {
 		str += " ORDER BY __execd "
 	}
@@ -240,6 +260,13 @@ func (it *StatementIterator) buildQuery(contains bool, v graph.Value) (string, [
 		str = strings.Replace(str, "?", fmt.Sprintf("$%d", i), 1)
 	}
 	glog.V(2).Infoln(str)
+	if glog.V(4) {
+		dstr := str
+		for i := 1; i <= len(values); i++ {
+			dstr = strings.Replace(dstr, fmt.Sprintf("$%d", i), fmt.Sprintf("'%s'", values[i-1]), 1)
+		}
+		glog.V(4).Infoln(dstr)
+	}
 	return str, values
 }
 
@@ -385,6 +412,12 @@ func (it *StatementIterator) Contains(v graph.Value) bool {
 		ivalues = append(ivalues, v)
 	}
 	it.cursor, err = it.qs.db.Query(q, ivalues...)
+	if err != nil {
+		glog.Errorf("Couldn't make query: %v", err)
+		it.err = err
+		it.cursor.Close()
+		return false
+	}
 	it.cols, err = it.cursor.Columns()
 	if err != nil {
 		glog.Errorf("Couldn't get columns")
@@ -435,10 +468,17 @@ func (it *StatementIterator) Size() (int64, bool) {
 		return it.size, true
 	}
 	if it.stType == node {
-		return 2, true
+		if it.where == nil {
+			return it.qs.Size() / int64(len(it.buildWhere)+1), true
+		}
+		return it.qs.Size() / int64(it.where.size()+len(it.buildWhere)+1), true
 	}
 	b := it.buildWhere[0]
-	it.size = it.qs.sizeForIterator(false, b.pair.dir, b.strTarget[0])
+	if len(b.strTarget) > 0 {
+		it.size = it.qs.sizeForIterator(false, b.pair.dir, b.strTarget[0])
+	} else {
+		return it.qs.Size(), false
+	}
 	return it.size, true
 }
 
@@ -563,7 +603,7 @@ func (it *StatementIterator) Next() bool {
 		return graph.NextLogOut(it, nil, false)
 	}
 	it.buildResult(0)
-	return graph.NextLogOut(it, it.result, true)
+	return graph.NextLogOut(it, it.Result(), true)
 }
 
 func (it *StatementIterator) scan() ([]string, error) {
