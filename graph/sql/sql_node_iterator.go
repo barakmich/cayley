@@ -18,6 +18,7 @@ import (
 	"database/sql"
 	"fmt"
 
+	"github.com/barakmich/glog"
 	"github.com/google/cayley/graph"
 	"github.com/google/cayley/graph/iterator"
 )
@@ -171,4 +172,117 @@ func (n *SQLNodeIterator) buildResult(i int) {
 	for i, c := range n.cols {
 		n.result[c] = container[i]
 	}
+}
+
+func (n *SQLNodeIterator) getTables() []string {
+	var out []string
+	for _, i := range n.linkIts {
+		out = append(out, i.it.getTables()...)
+	}
+	return out
+}
+
+func (n *SQLNodeIterator) tableID() tagDir {
+	return tagDir{}
+}
+
+func (n *SQLNodeIterator) getTags() []tagDir {
+	//STUB
+	return []tagDir{}
+}
+
+func (n *SQLNodeIterator) buildWhere() (string, []string) {
+	//STUB
+	return "", []string{}
+}
+
+func (n *SQLNodeIterator) Next() bool {
+	var err error
+	graph.NextLogIn(n)
+	if n.cursor == nil {
+		err = n.makeCursor(true, nil)
+		n.cols, err = n.cursor.Columns()
+		if err != nil {
+			glog.Errorf("Couldn't get columns")
+			n.err = err
+			n.cursor.Close()
+			return false
+		}
+		// iterate the first one
+		if !n.cursor.Next() {
+			glog.V(4).Infoln("sql: No next")
+			err := n.cursor.Err()
+			if err != nil {
+				glog.Errorf("Cursor error in SQL: %v", err)
+				n.err = err
+			}
+			n.cursor.Close()
+			return false
+		}
+		s, err := scan(n.cursor, len(n.cols))
+		if err != nil {
+			n.err = err
+			n.cursor.Close()
+			return false
+		}
+		n.resultNext = append(n.resultNext, s)
+	}
+	if n.resultList != nil && n.resultNext == nil {
+		// We're on something and there's no next
+		return false
+	}
+	n.resultList = n.resultNext
+	n.resultNext = nil
+	n.resultIndex = 0
+	for {
+		if !n.cursor.Next() {
+			glog.V(4).Infoln("sql: No next")
+			err := n.cursor.Err()
+			if err != nil {
+				glog.Errorf("Cursor error in SQL: %v", err)
+				n.err = err
+			}
+			n.cursor.Close()
+			break
+		}
+		s, err := scan(n.cursor, len(n.cols))
+		if err != nil {
+			n.err = err
+			n.cursor.Close()
+			return false
+		}
+		if n.resultList[0][0] != s[0] {
+			n.resultNext = append(n.resultNext, s)
+			break
+		} else {
+			n.resultList = append(n.resultList, s)
+		}
+
+	}
+	if len(n.resultList) == 0 {
+		return graph.NextLogOut(n, nil, false)
+	}
+	n.buildResult(0)
+	return graph.NextLogOut(n, n.Result(), true)
+}
+
+func (n *SQLNodeIterator) makeCursor(next bool, value graph.Value) error {
+	if n.cursor != nil {
+		n.cursor.Close()
+	}
+	var q string
+	var values []string
+	q, values = n.buildSQL(next, value)
+	ivalues := make([]interface{}, 0, len(values))
+	for _, v := range values {
+		ivalues = append(ivalues, v)
+	}
+	cursor, err := n.qs.db.Query(q, ivalues...)
+	if err != nil {
+		glog.Errorf("Couldn't get cursor from SQL database: %v", err)
+		cursor = nil
+		return err
+	}
+	n.cursor = cursor
+	return nil
 }

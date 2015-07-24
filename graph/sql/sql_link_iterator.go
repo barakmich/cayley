@@ -17,8 +17,10 @@ package sql
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync/atomic"
 
+	"github.com/barakmich/glog"
 	"github.com/google/cayley/graph"
 	"github.com/google/cayley/graph/iterator"
 	"github.com/google/cayley/quad"
@@ -30,7 +32,7 @@ var sqlTableID uint64
 func init() {
 	sqlLinkType = graph.RegisterIterator("sqllink")
 	sqlNodeType = graph.RegisterIterator("sqlnode")
-	atomic.StoreUint64(&sqlTableID, 1)
+	atomic.StoreUint64(&sqlTableID, 0)
 }
 
 func newTableName() string {
@@ -46,6 +48,9 @@ type constraint struct {
 type tagDir struct {
 	tag string
 	dir quad.Direction
+
+	// Not to be stored in the iterator directly
+	table string
 }
 
 type sqlItDir struct {
@@ -55,6 +60,10 @@ type sqlItDir struct {
 
 type sqlIterator interface {
 	sqlClone() sqlIterator
+	getTables() []string
+	getTags() []tagDir
+	buildWhere() (string, []string)
+	tableID() tagDir
 }
 
 type SQLLinkIterator struct {
@@ -87,7 +96,8 @@ func NewSQLLinkIterator(qs *QuadStore, d quad.Direction, val string) *SQLLinkIte
 				vals: []string{val},
 			},
 		},
-		size: 0,
+		tableName: newTableName(),
+		size:      0,
 	}
 	return l
 }
@@ -207,7 +217,51 @@ func (l *SQLLinkIterator) Type() graph.Type {
 }
 
 func (l *SQLLinkIterator) Contains(v graph.Value) bool {
-	// STUB
+	var err error
+	//if it.preFilter(v) {
+	//return false
+	//}
+	err = l.makeCursor(false, v)
+	if err != nil {
+		glog.Errorf("Couldn't make query: %v", err)
+		l.err = err
+		l.cursor.Close()
+		return false
+	}
+	l.cols, err = l.cursor.Columns()
+	if err != nil {
+		glog.Errorf("Couldn't get columns")
+		l.err = err
+		l.cursor.Close()
+		return false
+	}
+	l.resultList = nil
+	for {
+		if !l.cursor.Next() {
+			glog.V(4).Infoln("sql: No next")
+			err := l.cursor.Err()
+			if err != nil {
+				glog.Errorf("Cursor error in SQL: %v", err)
+				l.err = err
+			}
+			l.cursor.Close()
+			break
+		}
+		s, err := scan(l.cursor, len(l.cols))
+		if err != nil {
+			l.err = err
+			l.cursor.Close()
+			return false
+		}
+		l.resultList = append(l.resultList, s)
+	}
+	l.cursor.Close()
+	l.cursor = nil
+	if len(l.resultList) != 0 {
+		l.resultIndex = 0
+		l.buildResult(0)
+		return true
+	}
 	return false
 }
 
@@ -232,6 +286,213 @@ func (l *SQLLinkIterator) buildResult(i int) {
 	for i, c := range l.cols[4:] {
 		l.result[c] = container[i+4]
 	}
+}
+
+func (l *SQLLinkIterator) getTables() []string {
+	out := []string{l.tableName}
+	for _, i := range l.nodeIts {
+		out = append(out, i.it.getTables()...)
+	}
+	return out
+}
+
+func (l *SQLLinkIterator) getTags() []tagDir {
+	var out []tagDir
+	for _, tag := range l.tagger.Tags() {
+		out = append(out, tagDir{
+			dir:   quad.Any,
+			table: l.tableName,
+			tag:   tag,
+		})
+	}
+	for _, i := range l.nodeIts {
+		out = append(out, i.it.getTags()...)
+	}
+	return out
+}
+
+func (l *SQLLinkIterator) buildWhere() (string, []string) {
+	var q []string
+	var vals []string
+	for _, c := range l.constraints {
+		q = append(q, fmt.Sprintf("%s.%s = ?", l.tableName, c.dir))
+		vals = append(vals, c.vals[0])
+	}
+	for _, i := range l.nodeIts {
+		s, v := i.it.buildWhere()
+		q = append(q, s)
+		vals = append(vals, v...)
+	}
+	query := strings.Join(q, " AND ")
+	return query, vals
+}
+
+func (l *SQLLinkIterator) tableID() tagDir {
+	return tagDir{
+		dir:   quad.Any,
+		table: l.tableName,
+	}
+}
+
+func (l *SQLLinkIterator) buildSQL(next bool, val graph.Value) (string, []string) {
+	query := "SELECT "
+	t := []string{
+		fmt.Sprintf("%s.subject", l.tableName),
+		fmt.Sprintf("%s.predicate", l.tableName),
+		fmt.Sprintf("%s.object", l.tableName),
+		fmt.Sprintf("%s.label", l.tableName),
+	}
+	for _, v := range l.getTags() {
+		t = append(t, fmt.Sprintf("%s.%s as %s", v.table, v.dir, v.tag))
+	}
+	query += strings.Join(t, ", ")
+	query += " FROM "
+	t = []string{}
+	for _, k := range l.getTables() {
+		t = append(t, fmt.Sprintf("quads as %s", k))
+	}
+	query += strings.Join(t, ", ")
+	query += " WHERE "
+	constraint, values := l.buildWhere()
+
+	if !next {
+		v := val.(quad.Quad)
+		if constraint == "" {
+			constraint += " AND "
+		}
+		t = []string{
+			fmt.Sprintf("%s.subject = ?", l.tableName),
+			fmt.Sprintf("%s.predicate = ?", l.tableName),
+			fmt.Sprintf("%s.object = ?", l.tableName),
+			fmt.Sprintf("%s.label = ?", l.tableName),
+		}
+		constraint += strings.Join(t, " AND ")
+		values = append(values, v.Subject)
+		values = append(values, v.Predicate)
+		values = append(values, v.Object)
+		values = append(values, v.Label)
+	}
+	query += constraint
+	query += ";"
+
+	// Convert to Postgres format
+	for i := 1; i <= len(values); i++ {
+		query = strings.Replace(query, "?", fmt.Sprintf("$%d", i), 1)
+	}
+
+	if glog.V(4) {
+		dstr := query
+		for i := 1; i <= len(values); i++ {
+			dstr = strings.Replace(dstr, fmt.Sprintf("$%d", i), fmt.Sprintf("'%s'", values[i-1]), 1)
+		}
+		glog.V(4).Infoln(dstr)
+	}
+	return query, values
+}
+
+func (l *SQLLinkIterator) makeCursor(next bool, value graph.Value) error {
+	if l.cursor != nil {
+		l.cursor.Close()
+	}
+	var q string
+	var values []string
+	q, values = l.buildSQL(next, value)
+	ivalues := make([]interface{}, 0, len(values))
+	for _, v := range values {
+		ivalues = append(ivalues, v)
+	}
+	cursor, err := l.qs.db.Query(q, ivalues...)
+	if err != nil {
+		glog.Errorf("Couldn't get cursor from SQL database: %v", err)
+		cursor = nil
+		return err
+	}
+	l.cursor = cursor
+	return nil
+}
+
+func scan(cursor *sql.Rows, nCols int) ([]string, error) {
+	pointers := make([]interface{}, nCols)
+	container := make([]string, nCols)
+	for i, _ := range pointers {
+		pointers[i] = &container[i]
+	}
+	err := cursor.Scan(pointers...)
+	if err != nil {
+		glog.Errorf("Error scanning iterator: %v", err)
+		return nil, err
+	}
+	return container, nil
+}
+
+func (l *SQLLinkIterator) Next() bool {
+	var err error
+	graph.NextLogIn(l)
+	if l.cursor == nil {
+		err = l.makeCursor(true, nil)
+		l.cols, err = l.cursor.Columns()
+		if err != nil {
+			glog.Errorf("Couldn't get columns")
+			l.err = err
+			l.cursor.Close()
+			return false
+		}
+		// iterate the first one
+		if !l.cursor.Next() {
+			glog.V(4).Infoln("sql: No next")
+			err := l.cursor.Err()
+			if err != nil {
+				glog.Errorf("Cursor error in SQL: %v", err)
+				l.err = err
+			}
+			l.cursor.Close()
+			return false
+		}
+		s, err := scan(l.cursor, len(l.cols))
+		if err != nil {
+			l.err = err
+			l.cursor.Close()
+			return false
+		}
+		l.resultNext = append(l.resultNext, s)
+	}
+	if l.resultList != nil && l.resultNext == nil {
+		// We're on something and there's no next
+		return false
+	}
+	l.resultList = l.resultNext
+	l.resultNext = nil
+	l.resultIndex = 0
+	for {
+		if !l.cursor.Next() {
+			glog.V(4).Infoln("sql: No next")
+			err := l.cursor.Err()
+			if err != nil {
+				glog.Errorf("Cursor error in SQL: %v", err)
+				l.err = err
+			}
+			l.cursor.Close()
+			break
+		}
+		s, err := scan(l.cursor, len(l.cols))
+		if err != nil {
+			l.err = err
+			l.cursor.Close()
+			return false
+		}
+		if l.resultList[0][0] == s[0] && l.resultList[0][1] == s[1] && l.resultList[0][2] == s[2] && l.resultList[0][3] == s[3] {
+			l.resultList = append(l.resultList, s)
+		} else {
+			l.resultNext = append(l.resultNext, s)
+			break
+		}
+
+	}
+	if len(l.resultList) == 0 {
+		return graph.NextLogOut(l, nil, false)
+	}
+	l.buildResult(0)
+	return graph.NextLogOut(l, l.Result(), true)
 }
 
 type SQLAllIterator struct {
