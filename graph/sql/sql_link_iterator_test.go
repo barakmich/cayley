@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/google/cayley/graph"
+	"github.com/google/cayley/graph/iterator"
 	"github.com/google/cayley/quad"
 )
 
@@ -49,6 +50,38 @@ func TestSQLLinkIteration(t *testing.T) {
 		c += 1
 	}
 	if c != 18 {
-		t.Errorf("Not enough results, got %d expected 18")
+		t.Errorf("Not enough results, got %d expected 18", c)
 	}
+}
+
+func TestSQLNodeIteration(t *testing.T) {
+	if *dbpath == "" {
+		t.SkipNow()
+	}
+	db, err := newQuadStore(*dbpath, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := NewSQLLinkIterator(db.(*QuadStore), quad.Object, "/en/humphrey_bogart")
+	it := &SQLNodeIterator{
+		uid:       iterator.NextUID(),
+		qs:        db.(*QuadStore),
+		tableName: newTableName(),
+		linkIts: []sqlItDir{
+			sqlItDir{it: link,
+				dir: quad.Subject,
+			},
+		},
+	}
+	s, v := it.buildSQL(true, nil)
+	fmt.Println(s, v)
+	c := 0
+	for graph.Next(it) {
+		fmt.Println(it.Result())
+		c += 1
+	}
+	if c != 56 {
+		t.Errorf("Not enough results, got %d expected 56", c)
+	}
+
 }

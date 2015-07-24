@@ -207,10 +207,28 @@ func (n *SQLNodeIterator) getTags() []tagDir {
 			tag:   tag,
 		})
 	}
+	for _, tag := range n.tagdirs {
+		out = append(out, tagDir{
+			dir:   tag.dir,
+			table: myTag.table,
+			tag:   tag.tag,
+		})
+
+	}
 	for _, i := range n.linkIts {
 		out = append(out, i.it.getTags()...)
 	}
 	return out
+}
+
+func (n *SQLNodeIterator) height() int {
+	v := 0
+	for _, i := range n.linkIts {
+		if i.it.height() > v {
+			v = i.it.height()
+		}
+	}
+	return v + 1
 }
 
 func (n *SQLNodeIterator) buildWhere() (string, []string) {
@@ -254,7 +272,7 @@ func (n *SQLNodeIterator) buildSQL(next bool, val graph.Value) (string, []string
 
 	if !next {
 		v := val.(string)
-		if constraint == "" {
+		if constraint != "" {
 			constraint += " AND "
 		}
 		constraint += fmt.Sprintf("%s.%s = ?", topData.table, topData.dir)
@@ -263,15 +281,12 @@ func (n *SQLNodeIterator) buildSQL(next bool, val graph.Value) (string, []string
 	query += constraint
 	query += ";"
 
-	// Convert to Postgres format
-	for i := 1; i <= len(values); i++ {
-		query = strings.Replace(query, "?", fmt.Sprintf("$%d", i), 1)
-	}
+	glog.V(2).Infoln(query)
 
 	if glog.V(4) {
 		dstr := query
 		for i := 1; i <= len(values); i++ {
-			dstr = strings.Replace(dstr, fmt.Sprintf("$%d", i), fmt.Sprintf("'%s'", values[i-1]), 1)
+			dstr = strings.Replace(dstr, "?", fmt.Sprintf("'%s'", values[i-1]), 1)
 		}
 		glog.V(4).Infoln(dstr)
 	}
@@ -355,6 +370,7 @@ func (n *SQLNodeIterator) makeCursor(next bool, value graph.Value) error {
 	var q string
 	var values []string
 	q, values = n.buildSQL(next, value)
+	q = convertToPostgres(q, values)
 	ivalues := make([]interface{}, 0, len(values))
 	for _, v := range values {
 		ivalues = append(ivalues, v)
