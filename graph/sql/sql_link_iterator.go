@@ -319,6 +319,10 @@ func (l *SQLLinkIterator) buildWhere() (string, []string) {
 		vals = append(vals, c.vals[0])
 	}
 	for _, i := range l.nodeIts {
+		t := i.it.tableID()
+		q = append(q, fmt.Sprintf("%s.%s = %s.%s", l.tableName, i.dir, t.table, t.dir))
+	}
+	for _, i := range l.nodeIts {
 		s, v := i.it.buildWhere()
 		q = append(q, s)
 		vals = append(vals, v...)

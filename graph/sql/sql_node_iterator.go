@@ -17,10 +17,12 @@ package sql
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 
 	"github.com/barakmich/glog"
 	"github.com/google/cayley/graph"
 	"github.com/google/cayley/graph/iterator"
+	"github.com/google/cayley/quad"
 )
 
 var sqlNodeType graph.Type
@@ -30,10 +32,11 @@ func init() {
 }
 
 type SQLNodeIterator struct {
-	uid    uint64
-	qs     *QuadStore
-	tagger graph.Tagger
-	err    error
+	uid       uint64
+	qs        *QuadStore
+	tagger    graph.Tagger
+	tableName string
+	err       error
 
 	cursor  *sql.Rows
 	linkIts []sqlItDir
@@ -53,9 +56,10 @@ func (n *SQLNodeIterator) sqlClone() sqlIterator {
 
 func (n *SQLNodeIterator) Clone() graph.Iterator {
 	m := &SQLNodeIterator{
-		uid:  iterator.NextUID(),
-		qs:   n.qs,
-		size: n.size,
+		uid:       iterator.NextUID(),
+		qs:        n.qs,
+		size:      n.size,
+		tableName: n.tableName,
 	}
 	for _, i := range n.linkIts {
 		m.linkIts = append(m.linkIts, sqlItDir{
@@ -152,11 +156,6 @@ func (n *SQLNodeIterator) Stats() graph.IteratorStats {
 	}
 }
 
-func (n *SQLNodeIterator) Contains(v graph.Value) bool {
-	// STUB
-	return false
-}
-
 func (n *SQLNodeIterator) NextPath() bool {
 	n.resultIndex += 1
 	if n.resultIndex >= len(n.resultList) {
@@ -179,21 +178,104 @@ func (n *SQLNodeIterator) getTables() []string {
 	for _, i := range n.linkIts {
 		out = append(out, i.it.getTables()...)
 	}
+	if len(out) == 0 {
+		out = append(out, n.tableName)
+	}
 	return out
 }
 
 func (n *SQLNodeIterator) tableID() tagDir {
-	return tagDir{}
+	if len(n.linkIts) == 0 {
+		return tagDir{
+			table: n.tableName,
+			dir:   quad.Any,
+		}
+	}
+	return tagDir{
+		table: n.linkIts[0].it.tableID().table,
+		dir:   n.linkIts[0].dir,
+	}
 }
 
 func (n *SQLNodeIterator) getTags() []tagDir {
-	//STUB
-	return []tagDir{}
+	myTag := n.tableID()
+	var out []tagDir
+	for _, tag := range n.tagger.Tags() {
+		out = append(out, tagDir{
+			dir:   myTag.dir,
+			table: myTag.table,
+			tag:   tag,
+		})
+	}
+	for _, i := range n.linkIts {
+		out = append(out, i.it.getTags()...)
+	}
+	return out
 }
 
 func (n *SQLNodeIterator) buildWhere() (string, []string) {
-	//STUB
-	return "", []string{}
+	var q []string
+	var vals []string
+	if len(n.linkIts) > 1 {
+		baseTable := n.linkIts[0].it.tableID().table
+		baseDir := n.linkIts[0].dir
+		for _, i := range n.linkIts[1:] {
+			table := i.it.tableID().table
+			dir := i.dir
+			q = append(q, fmt.Sprintf("%s.%s = %s.%s", baseTable, baseDir, table, dir))
+		}
+	}
+	for _, i := range n.linkIts {
+		s, v := i.it.buildWhere()
+		q = append(q, s)
+		vals = append(vals, v...)
+	}
+	query := strings.Join(q, " AND ")
+	return query, vals
+}
+
+func (n *SQLNodeIterator) buildSQL(next bool, val graph.Value) (string, []string) {
+	topData := n.tableID()
+	query := "SELECT "
+	var t []string
+	t = append(t, fmt.Sprintf("%s.%s as __execd", topData.table, topData.dir))
+	for _, v := range n.getTags() {
+		t = append(t, fmt.Sprintf("%s.%s as %s", v.table, v.dir, v.tag))
+	}
+	query += strings.Join(t, ", ")
+	query += " FROM "
+	t = []string{}
+	for _, k := range n.getTables() {
+		t = append(t, fmt.Sprintf("quads as %s", k))
+	}
+	query += strings.Join(t, ", ")
+	query += " WHERE "
+	constraint, values := n.buildWhere()
+
+	if !next {
+		v := val.(string)
+		if constraint == "" {
+			constraint += " AND "
+		}
+		constraint += fmt.Sprintf("%s.%s = ?", topData.table, topData.dir)
+		values = append(values, v)
+	}
+	query += constraint
+	query += ";"
+
+	// Convert to Postgres format
+	for i := 1; i <= len(values); i++ {
+		query = strings.Replace(query, "?", fmt.Sprintf("$%d", i), 1)
+	}
+
+	if glog.V(4) {
+		dstr := query
+		for i := 1; i <= len(values); i++ {
+			dstr = strings.Replace(dstr, fmt.Sprintf("$%d", i), fmt.Sprintf("'%s'", values[i-1]), 1)
+		}
+		glog.V(4).Infoln(dstr)
+	}
+	return query, values
 }
 
 func (n *SQLNodeIterator) Next() bool {
@@ -285,4 +367,53 @@ func (n *SQLNodeIterator) makeCursor(next bool, value graph.Value) error {
 	}
 	n.cursor = cursor
 	return nil
+}
+
+func (n *SQLNodeIterator) Contains(v graph.Value) bool {
+	var err error
+	//if it.preFilter(v) {
+	//return false
+	//}
+	err = n.makeCursor(false, v)
+	if err != nil {
+		glog.Errorf("Couldn't make query: %v", err)
+		n.err = err
+		n.cursor.Close()
+		return false
+	}
+	n.cols, err = n.cursor.Columns()
+	if err != nil {
+		glog.Errorf("Couldn't get columns")
+		n.err = err
+		n.cursor.Close()
+		return false
+	}
+	n.resultList = nil
+	for {
+		if !n.cursor.Next() {
+			glog.V(4).Infoln("sql: No next")
+			err := n.cursor.Err()
+			if err != nil {
+				glog.Errorf("Cursor error in SQL: %v", err)
+				n.err = err
+			}
+			n.cursor.Close()
+			break
+		}
+		s, err := scan(n.cursor, len(n.cols))
+		if err != nil {
+			n.err = err
+			n.cursor.Close()
+			return false
+		}
+		n.resultList = append(n.resultList, s)
+	}
+	n.cursor.Close()
+	n.cursor = nil
+	if len(n.resultList) != 0 {
+		n.resultIndex = 0
+		n.buildResult(0)
+		return true
+	}
+	return false
 }
