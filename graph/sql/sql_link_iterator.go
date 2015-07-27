@@ -58,6 +58,7 @@ type sqlItDir struct {
 }
 
 type sqlIterator interface {
+	buildSQL(next bool, val graph.Value) (string, []string)
 	sqlClone() sqlIterator
 	getTables() []string
 	getTags() []tagDir
@@ -76,6 +77,7 @@ type SQLLinkIterator struct {
 	constraints []constraint
 	tableName   string
 	size        int64
+	tagdirs     []tagDir
 
 	result      map[string]string
 	resultIndex int
@@ -111,7 +113,8 @@ func (l *SQLLinkIterator) Clone() graph.Iterator {
 		qs:          l.qs,
 		tableName:   l.tableName,
 		size:        l.size,
-		constraints: make([]constraint, 0, len(l.constraints)),
+		constraints: make([]constraint, len(l.constraints)),
+		tagdirs:     make([]tagDir, len(l.tagdirs)),
 	}
 	for _, i := range l.nodeIts {
 		m.nodeIts = append(m.nodeIts, sqlItDir{
@@ -120,6 +123,7 @@ func (l *SQLLinkIterator) Clone() graph.Iterator {
 		})
 	}
 	copy(m.constraints, l.constraints)
+	copy(m.tagdirs, l.tagdirs)
 	m.tagger.CopyFrom(l)
 	return m
 }
@@ -187,6 +191,9 @@ func (l *SQLLinkIterator) Size() (int64, bool) {
 	}
 	if len(l.constraints) > 0 {
 		l.size = l.qs.sizeForIterator(false, l.constraints[0].dir, l.constraints[0].vals[0])
+	} else if len(l.nodeIts) > 1 {
+		subsize, _ := l.nodeIts[0].it.(*SQLNodeIterator).Size()
+		return subsize * 20, false
 	} else {
 		return l.qs.Size(), false
 	}
@@ -216,11 +223,31 @@ func (l *SQLLinkIterator) Type() graph.Type {
 	return sqlLinkType
 }
 
+func (l *SQLLinkIterator) preFilter(v graph.Value) bool {
+	for _, c := range l.constraints {
+		none := true
+		desired := v.(quad.Quad).Get(c.dir)
+		for _, s := range c.vals {
+			if s == desired {
+				none = false
+				break
+			}
+		}
+		if none {
+			return true
+		}
+	}
+	return false
+}
+
 func (l *SQLLinkIterator) Contains(v graph.Value) bool {
 	var err error
-	//if it.preFilter(v) {
-	//return false
-	//}
+	if l.preFilter(v) {
+		return false
+	}
+	if len(l.nodeIts) == 0 {
+		return true
+	}
 	err = l.makeCursor(false, v)
 	if err != nil {
 		glog.Errorf("Couldn't make query: %v", err)
@@ -305,6 +332,14 @@ func (l *SQLLinkIterator) getTags() []tagDir {
 			tag:   tag,
 		})
 	}
+	for _, tag := range l.tagdirs {
+		out = append(out, tagDir{
+			dir:   tag.dir,
+			table: l.tableName,
+			tag:   tag.tag,
+		})
+
+	}
 	for _, i := range l.nodeIts {
 		out = append(out, i.it.getTags()...)
 	}
@@ -339,7 +374,7 @@ func (l *SQLLinkIterator) tableID() tagDir {
 }
 
 func (l *SQLLinkIterator) buildSQL(next bool, val graph.Value) (string, []string) {
-	query := "SELECT "
+	query := "SELECT DISTINCT "
 	t := []string{
 		fmt.Sprintf("%s.subject", l.tableName),
 		fmt.Sprintf("%s.predicate", l.tableName),

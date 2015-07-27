@@ -18,6 +18,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"github.com/barakmich/glog"
 	"github.com/google/cayley/graph"
@@ -26,9 +27,16 @@ import (
 )
 
 var sqlNodeType graph.Type
+var sqlNodeTableID uint64
 
 func init() {
 	sqlNodeType = graph.RegisterIterator("sqlnode")
+	atomic.StoreUint64(&sqlNodeTableID, 0)
+}
+
+func newNodeTableName() string {
+	id := atomic.AddUint64(&sqlNodeTableID, 1)
+	return fmt.Sprintf("n_%d", id)
 }
 
 type SQLNodeIterator struct {
@@ -41,7 +49,6 @@ type SQLNodeIterator struct {
 	cursor  *sql.Rows
 	linkIts []sqlItDir
 	size    int64
-	tagdirs []tagDir
 
 	result      map[string]string
 	resultIndex int
@@ -67,7 +74,6 @@ func (n *SQLNodeIterator) Clone() graph.Iterator {
 			it:  i.it.sqlClone(),
 		})
 	}
-	copy(n.tagdirs, m.tagdirs)
 	m.tagger.CopyFrom(n)
 	return m
 }
@@ -197,7 +203,7 @@ func (n *SQLNodeIterator) tableID() tagDir {
 	}
 }
 
-func (n *SQLNodeIterator) getTags() []tagDir {
+func (n *SQLNodeIterator) getLocalTags() []tagDir {
 	myTag := n.tableID()
 	var out []tagDir
 	for _, tag := range n.tagger.Tags() {
@@ -207,14 +213,11 @@ func (n *SQLNodeIterator) getTags() []tagDir {
 			tag:   tag,
 		})
 	}
-	for _, tag := range n.tagdirs {
-		out = append(out, tagDir{
-			dir:   tag.dir,
-			table: myTag.table,
-			tag:   tag.tag,
-		})
+	return out
+}
 
-	}
+func (n *SQLNodeIterator) getTags() []tagDir {
+	out := n.getLocalTags()
 	for _, i := range n.linkIts {
 		out = append(out, i.it.getTags()...)
 	}
@@ -242,9 +245,75 @@ func (n *SQLNodeIterator) buildWhere() (string, []string) {
 	return query, vals
 }
 
+func (n *SQLNodeIterator) buildMultiSQL(next bool, val graph.Value) (string, []string) {
+	nodetables := make([]string, len(n.linkIts))
+	for i, _ := range nodetables {
+		nodetables[i] = newNodeTableName()
+	}
+	query := "SELECT DISTINCT "
+
+	var t []string
+	t = append(t, fmt.Sprintf("%s.__execd as __execd", nodetables[0]))
+	for _, v := range n.getLocalTags() {
+		t = append(t, fmt.Sprintf("%s.__execd as %s", nodetables[0], v.tag))
+	}
+	for i, it := range n.linkIts {
+		for _, v := range it.it.getTags() {
+			t = append(t, fmt.Sprintf("%s.%s as %s", nodetables[i], v.tag, v.tag))
+		}
+	}
+
+	query += strings.Join(t, ", ")
+	query += " FROM "
+	t = []string{}
+	var values []string
+	for i, it := range n.linkIts {
+		// TODO(barakmich): This is a dirty hack. The real implementation is to
+		// separate SQL iterators to build a similar tree as we're doing here, and
+		// have a single graph.Iterator 'caddy' structure around it.
+		subNode := &SQLNodeIterator{
+			uid:       iterator.NextUID(),
+			tableName: newTableName(),
+			linkIts:   []sqlItDir{it},
+		}
+		q, vs := subNode.buildSQL(true, nil)
+		values = append(values, vs...)
+		t = append(t, fmt.Sprintf("\n(%s) as %s", q[:len(q)-1], nodetables[i]))
+	}
+	query += strings.Join(t, ", ")
+	query += " WHERE "
+	t = []string{}
+
+	for _, tb := range nodetables[1:] {
+		t = append(t, fmt.Sprintf("%s.__execd = %s.__execd", nodetables[0], tb))
+	}
+
+	if !next {
+		v := val.(string)
+		t = append(t, fmt.Sprintf("%s.__execd = ?", nodetables[0]))
+		values = append(values, v)
+	}
+	query += strings.Join(t, " AND ")
+	query += ";"
+
+	glog.V(2).Infoln(query)
+
+	if glog.V(4) {
+		dstr := query
+		for i := 1; i <= len(values); i++ {
+			dstr = strings.Replace(dstr, "?", fmt.Sprintf("'%s'", values[i-1]), 1)
+		}
+		glog.V(4).Infoln(dstr)
+	}
+	return query, values
+}
+
 func (n *SQLNodeIterator) buildSQL(next bool, val graph.Value) (string, []string) {
+	if len(n.linkIts) > 1 {
+		return n.buildMultiSQL(next, val)
+	}
 	topData := n.tableID()
-	query := "SELECT "
+	query := "SELECT DISTINCT "
 	var t []string
 	t = append(t, fmt.Sprintf("%s.%s as __execd", topData.table, topData.dir))
 	for _, v := range n.getTags() {
