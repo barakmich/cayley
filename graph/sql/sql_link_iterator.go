@@ -45,11 +45,26 @@ type constraint struct {
 }
 
 type tagDir struct {
-	tag string
-	dir quad.Direction
+	tag       string
+	dir       quad.Direction
+	table     string
+	justLocal bool
+}
 
-	// Not to be stored in the iterator directly
-	table string
+func (t tagDir) String() string {
+	if t.dir == quad.Any {
+		if t.justLocal {
+			return fmt.Sprintf("%s.__execd as %s", t.table, t.tag)
+		}
+		return fmt.Sprintf("%s.%s as %s", t.table, t.tag, t.tag)
+	}
+	return fmt.Sprintf("%s.%s as %s", t.table, t.dir, t.tag)
+}
+
+type tableDef struct {
+	table  string
+	name   string
+	values []string
 }
 
 type sqlItDir struct {
@@ -60,7 +75,7 @@ type sqlItDir struct {
 type sqlIterator interface {
 	buildSQL(next bool, val graph.Value) (string, []string)
 	sqlClone() sqlIterator
-	getTables() []string
+	getTables() []tableDef
 	getTags() []tagDir
 	buildWhere() (string, []string)
 	tableID() tagDir
@@ -315,8 +330,8 @@ func (l *SQLLinkIterator) buildResult(i int) {
 	}
 }
 
-func (l *SQLLinkIterator) getTables() []string {
-	out := []string{l.tableName}
+func (l *SQLLinkIterator) getTables() []tableDef {
+	out := []tableDef{tableDef{table: "quads", name: l.tableName}}
 	for _, i := range l.nodeIts {
 		out = append(out, i.it.getTables()...)
 	}
@@ -355,7 +370,11 @@ func (l *SQLLinkIterator) buildWhere() (string, []string) {
 	}
 	for _, i := range l.nodeIts {
 		t := i.it.tableID()
-		q = append(q, fmt.Sprintf("%s.%s = %s.%s", l.tableName, i.dir, t.table, t.dir))
+		dir := t.dir.String()
+		if t.dir == quad.Any {
+			dir = t.tag
+		}
+		q = append(q, fmt.Sprintf("%s.%s = %s.%s", l.tableName, i.dir, t.table, dir))
 	}
 	for _, i := range l.nodeIts {
 		s, v := i.it.buildWhere()
@@ -382,18 +401,21 @@ func (l *SQLLinkIterator) buildSQL(next bool, val graph.Value) (string, []string
 		fmt.Sprintf("%s.label", l.tableName),
 	}
 	for _, v := range l.getTags() {
-		t = append(t, fmt.Sprintf("%s.%s as %s", v.table, v.dir, v.tag))
+		t = append(t, v.String())
 	}
 	query += strings.Join(t, ", ")
 	query += " FROM "
 	t = []string{}
+	var values []string
 	for _, k := range l.getTables() {
-		t = append(t, fmt.Sprintf("quads as %s", k))
+		values = append(values, k.values...)
+		t = append(t, fmt.Sprintf("%s as %s", k.table, k.name))
 	}
 	query += strings.Join(t, ", ")
 	query += " WHERE "
-	constraint, values := l.buildWhere()
+	constraint, wherevalues := l.buildWhere()
 
+	values = append(values, wherevalues...)
 	if !next {
 		v := val.(quad.Quad)
 		if constraint != "" {

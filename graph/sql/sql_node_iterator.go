@@ -46,9 +46,10 @@ type SQLNodeIterator struct {
 	tableName string
 	err       error
 
-	cursor  *sql.Rows
-	linkIts []sqlItDir
-	size    int64
+	cursor     *sql.Rows
+	linkIts    []sqlItDir
+	nodetables []string
+	size       int64
 
 	result      map[string]string
 	resultIndex int
@@ -179,27 +180,75 @@ func (n *SQLNodeIterator) buildResult(i int) {
 	}
 }
 
-func (n *SQLNodeIterator) getTables() []string {
-	var out []string
-	for _, i := range n.linkIts {
-		out = append(out, i.it.getTables()...)
+func (n *SQLNodeIterator) makeNodeTableNames() {
+	if n.nodetables != nil {
+		return
+	}
+	n.nodetables = make([]string, len(n.linkIts))
+	for i, _ := range n.nodetables {
+		n.nodetables[i] = newNodeTableName()
+	}
+}
+
+func (n *SQLNodeIterator) getTables() []tableDef {
+	var out []tableDef
+	switch len(n.linkIts) {
+	case 0:
+		return []tableDef{tableDef{table: "quads", name: n.tableName}}
+	case 1:
+		out = n.linkIts[0].it.getTables()
+	default:
+		return n.buildSubqueries()
 	}
 	if len(out) == 0 {
-		out = append(out, n.tableName)
+		out = append(out, tableDef{table: "quads", name: n.tableName})
+	}
+	return out
+}
+
+func (n *SQLNodeIterator) buildSubqueries() []tableDef {
+	var out []tableDef
+	n.makeNodeTableNames()
+	for i, it := range n.linkIts {
+		var td tableDef
+		// TODO(barakmich): This is a dirty hack. The real implementation is to
+		// separate SQL iterators to build a similar tree as we're doing here, and
+		// have a single graph.Iterator 'caddy' structure around it.
+		subNode := &SQLNodeIterator{
+			uid:       iterator.NextUID(),
+			tableName: newTableName(),
+			linkIts:   []sqlItDir{it},
+		}
+		var table string
+		table, td.values = subNode.buildSQL(true, nil)
+		td.table = fmt.Sprintf("\n(%s)", table[:len(table)-1])
+		td.name = n.nodetables[i]
+		out = append(out, td)
 	}
 	return out
 }
 
 func (n *SQLNodeIterator) tableID() tagDir {
-	if len(n.linkIts) == 0 {
+	switch len(n.linkIts) {
+	case 0:
 		return tagDir{
 			table: n.tableName,
 			dir:   quad.Any,
+			tag:   "__execd",
 		}
-	}
-	return tagDir{
-		table: n.linkIts[0].it.tableID().table,
-		dir:   n.linkIts[0].dir,
+	case 1:
+		return tagDir{
+			table: n.linkIts[0].it.tableID().table,
+			dir:   n.linkIts[0].dir,
+			tag:   "__execd",
+		}
+	default:
+		n.makeNodeTableNames()
+		return tagDir{
+			table: n.nodetables[0],
+			dir:   quad.Any,
+			tag:   "__execd",
+		}
 	}
 }
 
@@ -208,9 +257,10 @@ func (n *SQLNodeIterator) getLocalTags() []tagDir {
 	var out []tagDir
 	for _, tag := range n.tagger.Tags() {
 		out = append(out, tagDir{
-			dir:   myTag.dir,
-			table: myTag.table,
-			tag:   tag,
+			dir:       myTag.dir,
+			table:     myTag.table,
+			tag:       tag,
+			justLocal: true,
 		})
 	}
 	return out
@@ -218,6 +268,19 @@ func (n *SQLNodeIterator) getLocalTags() []tagDir {
 
 func (n *SQLNodeIterator) getTags() []tagDir {
 	out := n.getLocalTags()
+	if len(n.linkIts) > 1 {
+		n.makeNodeTableNames()
+		for i, it := range n.linkIts {
+			for _, v := range it.it.getTags() {
+				out = append(out, tagDir{
+					tag:   v.tag,
+					dir:   quad.Any,
+					table: n.nodetables[i],
+				})
+			}
+		}
+		return out
+	}
 	for _, i := range n.linkIts {
 		out = append(out, i.it.getTags()...)
 	}
@@ -228,106 +291,42 @@ func (n *SQLNodeIterator) buildWhere() (string, []string) {
 	var q []string
 	var vals []string
 	if len(n.linkIts) > 1 {
-		baseTable := n.linkIts[0].it.tableID().table
-		baseDir := n.linkIts[0].dir
-		for _, i := range n.linkIts[1:] {
-			table := i.it.tableID().table
-			dir := i.dir
-			q = append(q, fmt.Sprintf("%s.%s = %s.%s", baseTable, baseDir, table, dir))
+		for _, tb := range n.nodetables[1:] {
+			q = append(q, fmt.Sprintf("%s.__execd = %s.__execd", n.nodetables[0], tb))
 		}
-	}
-	for _, i := range n.linkIts {
-		s, v := i.it.buildWhere()
-		q = append(q, s)
-		vals = append(vals, v...)
+	} else {
+		for _, i := range n.linkIts {
+			s, v := i.it.buildWhere()
+			q = append(q, s)
+			vals = append(vals, v...)
+		}
 	}
 	query := strings.Join(q, " AND ")
 	return query, vals
 }
 
-func (n *SQLNodeIterator) buildMultiSQL(next bool, val graph.Value) (string, []string) {
-	nodetables := make([]string, len(n.linkIts))
-	for i, _ := range nodetables {
-		nodetables[i] = newNodeTableName()
-	}
+func (n *SQLNodeIterator) buildSQL(next bool, val graph.Value) (string, []string) {
+	topData := n.tableID()
+	tags := []tagDir{topData}
+	tags = append(tags, n.getTags()...)
 	query := "SELECT DISTINCT "
-
 	var t []string
-	t = append(t, fmt.Sprintf("%s.__execd as __execd", nodetables[0]))
-	for _, v := range n.getLocalTags() {
-		t = append(t, fmt.Sprintf("%s.__execd as %s", nodetables[0], v.tag))
+	for _, v := range tags {
+		t = append(t, v.String())
 	}
-	for i, it := range n.linkIts {
-		for _, v := range it.it.getTags() {
-			t = append(t, fmt.Sprintf("%s.%s as %s", nodetables[i], v.tag, v.tag))
-		}
-	}
-
 	query += strings.Join(t, ", ")
 	query += " FROM "
 	t = []string{}
 	var values []string
-	for i, it := range n.linkIts {
-		// TODO(barakmich): This is a dirty hack. The real implementation is to
-		// separate SQL iterators to build a similar tree as we're doing here, and
-		// have a single graph.Iterator 'caddy' structure around it.
-		subNode := &SQLNodeIterator{
-			uid:       iterator.NextUID(),
-			tableName: newTableName(),
-			linkIts:   []sqlItDir{it},
-		}
-		q, vs := subNode.buildSQL(true, nil)
-		values = append(values, vs...)
-		t = append(t, fmt.Sprintf("\n(%s) as %s", q[:len(q)-1], nodetables[i]))
-	}
-	query += strings.Join(t, ", ")
-	query += " WHERE "
-	t = []string{}
-
-	for _, tb := range nodetables[1:] {
-		t = append(t, fmt.Sprintf("%s.__execd = %s.__execd", nodetables[0], tb))
-	}
-
-	if !next {
-		v := val.(string)
-		t = append(t, fmt.Sprintf("%s.__execd = ?", nodetables[0]))
-		values = append(values, v)
-	}
-	query += strings.Join(t, " AND ")
-	query += ";"
-
-	glog.V(2).Infoln(query)
-
-	if glog.V(4) {
-		dstr := query
-		for i := 1; i <= len(values); i++ {
-			dstr = strings.Replace(dstr, "?", fmt.Sprintf("'%s'", values[i-1]), 1)
-		}
-		glog.V(4).Infoln(dstr)
-	}
-	return query, values
-}
-
-func (n *SQLNodeIterator) buildSQL(next bool, val graph.Value) (string, []string) {
-	if len(n.linkIts) > 1 {
-		return n.buildMultiSQL(next, val)
-	}
-	topData := n.tableID()
-	query := "SELECT DISTINCT "
-	var t []string
-	t = append(t, fmt.Sprintf("%s.%s as __execd", topData.table, topData.dir))
-	for _, v := range n.getTags() {
-		t = append(t, fmt.Sprintf("%s.%s as %s", v.table, v.dir, v.tag))
-	}
-	query += strings.Join(t, ", ")
-	query += " FROM "
-	t = []string{}
 	for _, k := range n.getTables() {
-		t = append(t, fmt.Sprintf("quads as %s", k))
+		values = append(values, k.values...)
+		t = append(t, fmt.Sprintf("%s as %s", k.table, k.name))
 	}
 	query += strings.Join(t, ", ")
 	query += " WHERE "
-	constraint, values := n.buildWhere()
+
+	constraint, wherevalues := n.buildWhere()
+	values = append(values, wherevalues...)
 
 	if !next {
 		v := val.(string)
@@ -437,6 +436,7 @@ func (n *SQLNodeIterator) makeCursor(next bool, value graph.Value) error {
 	cursor, err := n.qs.db.Query(q, ivalues...)
 	if err != nil {
 		glog.Errorf("Couldn't get cursor from SQL database: %v", err)
+		glog.Errorf("Query: %v", q)
 		cursor = nil
 		return err
 	}
