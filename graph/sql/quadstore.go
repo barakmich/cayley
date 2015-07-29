@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 
+	_ "github.com/Go-SQL-Driver/MySQL"
 	"github.com/lib/pq"
 
 	"github.com/barakmich/glog"
@@ -13,6 +14,7 @@ import (
 )
 
 const QuadStoreType = "sql"
+const DefaultSQLFlavor = "postgres"
 
 func init() {
 	graph.RegisterQuadStore(QuadStoreType, true, newQuadStore, createSQLTables, nil)
@@ -25,9 +27,16 @@ type QuadStore struct {
 	lru       *cache
 }
 
-func connectSQLTables(addr string, _ graph.Options) (*sql.DB, error) {
+func connectSQLTables(addr string, options graph.Options) (*sql.DB, error) {
 	// TODO(barakmich): Parse options for more friendly addr, other SQLs.
-	conn, err := sql.Open("postgres", addr)
+	flavor := DefaultSQLFlavor
+	val, ok, err := options.StringKey("sql_type")
+	if err != nil {
+		return nil, err
+	} else if ok {
+		flavor = val
+	}
+	conn, err := sql.Open(flavor, addr)
 	if err != nil {
 		glog.Errorf("Couldn't open database at %s: %#v", addr, err)
 		return nil, err
@@ -40,23 +49,51 @@ func createSQLTables(addr string, options graph.Options) error {
 	if err != nil {
 		return err
 	}
+	flavor := DefaultSQLFlavor
+	val, ok, err := options.StringKey("sql_type")
+	if err != nil {
+		return err
+	} else if ok {
+		flavor = val
+	}
 	tx, err := conn.Begin()
 	if err != nil {
 		glog.Errorf("Couldn't begin creation transaction: %s", err)
 		return err
 	}
+	var bigserial string
+	switch flavor {
+	case "postgres":
+		bigserial = "BIGSERIAL"
+	case "mysql":
+		bigserial = "BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE"
+	default:
+		panic("no support for flavor: " + flavor)
+	}
 
-	quadTable, err := tx.Exec(`
+	//quadTable, err := tx.Exec(
+	//fmt.Sprintf(`
+	//CREATE TABLE quads (
+	//subject TEXT NOT NULL,
+	//predicate TEXT NOT NULL,
+	//object TEXT NOT NULL,
+	//label TEXT,
+	//horizon %s PRIMARY KEY,
+	//id BIGINT,
+	//ts timestamp,
+	//UNIQUE(subject, predicate, object, label)
+	//);`, bigserial))
+	quadTable, err := tx.Exec(
+		fmt.Sprintf(`
 	CREATE TABLE quads (
 		subject TEXT NOT NULL,
 		predicate TEXT NOT NULL,
 		object TEXT NOT NULL,
 		label TEXT,
-		horizon BIGSERIAL PRIMARY KEY,
+		horizon %s PRIMARY KEY,
 		id BIGINT,
-		ts timestamp,
-		UNIQUE(subject, predicate, object, label)
-	);`)
+		ts timestamp
+	);`, bigserial))
 	if err != nil {
 		glog.Errorf("Cannot create quad table: %v", quadTable)
 		return err
@@ -79,12 +116,24 @@ func createSQLTables(addr string, options graph.Options) error {
 	CREATE INDEX pos_index ON quads (substr(predicate, 0, 8)) WITH (FILLFACTOR = %d);
 	CREATE INDEX osp_index ON quads (substr(object, 0, 8)) WITH (FILLFACTOR = %d);
 	`, factor, factor, factor))
+	} else if idxStrat == "mysql-btree" {
+		index, err = tx.Exec(`CREATE INDEX spo_index ON quads (subject(100), predicate(100), object(100)) USING BTREE;`)
+		if err != nil {
+			glog.Errorf("Cannot create index : %v", index)
+			return err
+		}
+		index, err = tx.Exec(`CREATE INDEX pos_index ON quads (predicate(100), object(100), subject(100)) USING BTREE;`)
+		if err != nil {
+			glog.Errorf("Cannot create index : %v", index)
+			return err
+		}
+		index, err = tx.Exec(`CREATE INDEX osp_index ON quads (object(100), subject(100), predicate(100)) USING BTREE;`)
 	} else {
 		index, err = tx.Exec(fmt.Sprintf(`
-	CREATE INDEX spo_index ON quads (subject, predicate, object) WITH (FILLFACTOR = %d);
-	CREATE INDEX pos_index ON quads (predicate, object, subject) WITH (FILLFACTOR = %d);
-	CREATE INDEX osp_index ON quads (object, subject, predicate) WITH (FILLFACTOR = %d);
-	`, factor, factor, factor))
+		CREATE INDEX spo_index ON quads (subject, predicate, object) WITH (FILLFACTOR = %d);
+		CREATE INDEX pos_index ON quads (predicate, object, subject) WITH (FILLFACTOR = %d);
+		CREATE INDEX osp_index ON quads (object, subject, predicate) WITH (FILLFACTOR = %d);
+		`, factor, factor, factor))
 	}
 	if err != nil {
 		glog.Errorf("Cannot create indices: %v", index)
@@ -101,7 +150,13 @@ func newQuadStore(addr string, options graph.Options) (graph.QuadStore, error) {
 		return nil, err
 	}
 	qs.db = conn
-	qs.sqlFlavor = "postgres"
+	qs.sqlFlavor = DefaultSQLFlavor
+	val, ok, err := options.StringKey("sql_type")
+	if err != nil {
+		return nil, err
+	} else if ok {
+		qs.sqlFlavor = val
+	}
 	qs.size = -1
 	qs.lru = newCache(1024)
 	return &qs, nil
@@ -176,6 +231,46 @@ func (qs *QuadStore) buildTxPostgres(tx *sql.Tx, in []graph.Delta) error {
 	return nil
 }
 
+func (qs *QuadStore) buildTxMysql(tx *sql.Tx, in []graph.Delta) error {
+	insert, err := tx.Prepare(`INSERT INTO quads(subject, predicate, object, label, id, ts) VALUES (?, ?, ?, ?, ?, ?)`)
+	if err != nil {
+		glog.Errorf("Cannot prepare insert statement: %v", err)
+		return err
+	}
+	for _, d := range in {
+		switch d.Action {
+		case graph.Add:
+			_, err := insert.Exec(d.Quad.Subject, d.Quad.Predicate, d.Quad.Object, d.Quad.Label, d.ID.Int(), d.Timestamp)
+			if err != nil {
+				glog.Errorf("couldn't prepare INSERT statement: %v", err)
+				return err
+			}
+			//for _, dir := range quad.Directions {
+			//_, err := tx.Exec(`
+			//WITH upsert AS (UPDATE nodes SET size=size+1 WHERE node=$1 RETURNING *)
+			//INSERT INTO nodes (node, size) SELECT $1, 1 WHERE NOT EXISTS (SELECT * FROM UPSERT);
+			//`, d.Quad.Get(dir))
+			//if err != nil {
+			//glog.Errorf("couldn't prepare upsert statement in direction %s: %v", dir, err)
+			//return err
+			//}
+			//}
+		case graph.Delete:
+			_, err := tx.Exec(`DELETE FROM quads WHERE subject=? and predicate=? and object=? and label=?;`,
+				d.Quad.Subject, d.Quad.Predicate, d.Quad.Object, d.Quad.Label)
+			if err != nil {
+				glog.Errorf("couldn't prepare DELETE statement: %v", err)
+			}
+			//for _, dir := range quad.Directions {
+			//tx.Exec(`UPDATE nodes SET size=size-1 WHERE node=$1;`, d.Quad.Get(dir))
+			//}
+		default:
+			panic("unknown action")
+		}
+	}
+	return nil
+}
+
 func (qs *QuadStore) ApplyDeltas(in []graph.Delta, _ graph.IgnoreOpts) error {
 	// TODO(barakmich): Support ignoreOpts? "ON CONFLICT IGNORE"
 	tx, err := qs.db.Begin()
@@ -186,6 +281,11 @@ func (qs *QuadStore) ApplyDeltas(in []graph.Delta, _ graph.IgnoreOpts) error {
 	switch qs.sqlFlavor {
 	case "postgres":
 		err = qs.buildTxPostgres(tx, in)
+		if err != nil {
+			return err
+		}
+	case "mysql":
+		err = qs.buildTxMysql(tx, in)
 		if err != nil {
 			return err
 		}
@@ -270,8 +370,14 @@ func (qs *QuadStore) sizeForIterator(isAll bool, dir quad.Direction, val string)
 	}
 	var size int64
 	glog.V(4).Infoln("sql: getting size for select %s, %s", dir.String(), val)
-	err = qs.db.QueryRow(
-		fmt.Sprintf("SELECT count(*) FROM quads WHERE %s = $1;", dir.String()), val).Scan(&size)
+	switch qs.sqlFlavor {
+	case "postgres":
+		err = qs.db.QueryRow(
+			fmt.Sprintf("SELECT count(*) FROM quads WHERE %s = $1;", dir.String()), val).Scan(&size)
+	case "mysql":
+		err = qs.db.QueryRow(
+			fmt.Sprintf("SELECT count(*) FROM quads WHERE %s = ?;", dir.String()), val).Scan(&size)
+	}
 	if err != nil {
 		glog.Errorln("Error getting size from SQL database: %v", err)
 		return 0

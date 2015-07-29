@@ -291,7 +291,9 @@ func (it *SQLIterator) makeCursor(next bool, value graph.Value) error {
 	var q string
 	var values []string
 	q, values = it.sql.buildSQL(next, value)
-	q = convertToPostgres(q, values)
+	if it.qs.sqlFlavor == "postgres" {
+		q = convertToPostgres(q, values)
+	}
 	ivalues := make([]interface{}, 0, len(values))
 	for _, v := range values {
 		ivalues = append(ivalues, v)

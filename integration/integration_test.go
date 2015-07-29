@@ -444,6 +444,8 @@ func prepare(t testing.TB) {
 		remote = true
 	case "sql":
 		cfg.DatabasePath = "postgres://localhost/cayley_test"
+		cfg.DatabaseOptions = make(map[string]interface{})
+		cfg.DatabaseOptions["sql_type"] = "postgres"
 		remote = true
 	default:
 		t.Fatalf("Untestable backend store %s", *backend)
