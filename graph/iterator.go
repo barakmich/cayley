@@ -242,6 +242,7 @@ const (
 	Optional
 	Materialize
 	Unique
+	Recursive
 )
 
 var (
