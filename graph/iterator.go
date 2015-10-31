@@ -265,6 +265,7 @@ var (
 		"optional",
 		"materialize",
 		"unique",
+		"recursive",
 	}
 )
 

@@ -118,7 +118,9 @@ func (it *Recursive) Next() bool {
 			for _, x := range it.depthCache {
 				it.baseIt.Add(x)
 			}
+			it.depthCache = nil
 			it.nextIt = it.morphism(it.qs, it.baseIt)
+			continue
 		}
 		val := it.nextIt.Result()
 		if _, ok := it.seen[val]; ok {
@@ -155,7 +157,8 @@ func (it *Recursive) Contains(val graph.Value) bool {
 			subat = it.seen[subat.val]
 		}
 		it.containsSub.Contains(subat.val)
-		it.result = at
+		it.result.depth = at.depth
+		it.result.val = val
 		return graph.ContainsLogOut(it, val, true)
 	}
 	for graph.Next(it) {

@@ -22,8 +22,8 @@ import (
 	"github.com/google/cayley/graph"
 )
 
-var simpleStore = &store{data: []string{"0", "1", "2", "3", "4", "5"}}
-var stringStore = &store{data: []string{"foo", "bar", "baz", "echo"}}
+var simpleStore = &oldstore{data: []string{"0", "1", "2", "3", "4", "5"}}
+var stringStore = &oldstore{data: []string{"foo", "bar", "baz", "echo"}}
 
 func simpleFixedIterator() *Fixed {
 	f := NewFixed(Identity)

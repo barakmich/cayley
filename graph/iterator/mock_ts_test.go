@@ -19,13 +19,13 @@ import (
 	"github.com/google/cayley/quad"
 )
 
-// store is a mocked version of the QuadStore interface, for use in tests.
-type store struct {
+// oldstore is a mocked version of the QuadStore interface, for use in tests.
+type oldstore struct {
 	data []string
-	iter graph.Iterator
+	iter graph.FixedIterator
 }
 
-func (qs *store) ValueOf(s string) graph.Value {
+func (qs *oldstore) ValueOf(s string) graph.Value {
 	for i, v := range qs.data {
 		if s == v {
 			return i
@@ -34,19 +34,19 @@ func (qs *store) ValueOf(s string) graph.Value {
 	return nil
 }
 
-func (qs *store) ApplyDeltas([]graph.Delta, graph.IgnoreOpts) error { return nil }
+func (qs *oldstore) ApplyDeltas([]graph.Delta, graph.IgnoreOpts) error { return nil }
 
-func (qs *store) Quad(graph.Value) quad.Quad { return quad.Quad{} }
+func (qs *oldstore) Quad(graph.Value) quad.Quad { return quad.Quad{} }
 
-func (qs *store) QuadIterator(d quad.Direction, i graph.Value) graph.Iterator {
+func (qs *oldstore) QuadIterator(d quad.Direction, i graph.Value) graph.Iterator {
 	return qs.iter
 }
 
-func (qs *store) NodesAllIterator() graph.Iterator { return &Null{} }
+func (qs *oldstore) NodesAllIterator() graph.Iterator { return &Null{} }
 
-func (qs *store) QuadsAllIterator() graph.Iterator { return &Null{} }
+func (qs *oldstore) QuadsAllIterator() graph.Iterator { return &Null{} }
 
-func (qs *store) NameOf(v graph.Value) string {
+func (qs *oldstore) NameOf(v graph.Value) string {
 	switch v.(type) {
 	case int:
 		i := v.(int)
@@ -61,11 +61,53 @@ func (qs *store) NameOf(v graph.Value) string {
 	}
 }
 
-func (qs *store) Size() int64 { return 0 }
+func (qs *oldstore) Size() int64 { return 0 }
 
-func (qs *store) Horizon() graph.PrimaryKey { return graph.NewSequentialKey(0) }
+func (qs *oldstore) Horizon() graph.PrimaryKey { return graph.NewSequentialKey(0) }
 
-func (qs *store) DebugPrint() {}
+func (qs *oldstore) DebugPrint() {}
+
+func (qs *oldstore) OptimizeIterator(it graph.Iterator) (graph.Iterator, bool) {
+	return &Null{}, false
+}
+
+func (qs *oldstore) FixedIterator() graph.FixedIterator {
+	return NewFixed(Identity)
+}
+
+func (qs *oldstore) Close() {}
+
+func (qs *oldstore) QuadDirection(graph.Value, quad.Direction) graph.Value { return 0 }
+
+func (qs *oldstore) RemoveQuad(t quad.Quad) {}
+
+func (qs *oldstore) Type() string { return "oldmockstore" }
+
+type store struct {
+	data []quad.Quad
+}
+
+var _ graph.QuadStore = &store{}
+
+func (qs *store) ValueOf(s string) graph.Value {
+	return s
+}
+
+func (qs *store) ApplyDeltas([]graph.Delta, graph.IgnoreOpts) error { return nil }
+
+func (qs *store) Quad(v graph.Value) quad.Quad { return v.(quad.Quad) }
+
+func (qs *store) NameOf(v graph.Value) string {
+	return v.(string)
+}
+
+func (qs *store) RemoveQuad(t quad.Quad) {}
+
+func (qs *store) Type() string { return "mockstore" }
+
+func (qs *store) QuadDirection(v graph.Value, d quad.Direction) graph.Value {
+	return qs.Quad(v).Get(d)
+}
 
 func (qs *store) OptimizeIterator(it graph.Iterator) (graph.Iterator, bool) {
 	return &Null{}, false
@@ -77,8 +119,40 @@ func (qs *store) FixedIterator() graph.FixedIterator {
 
 func (qs *store) Close() {}
 
-func (qs *store) QuadDirection(graph.Value, quad.Direction) graph.Value { return 0 }
+func (qs *store) Horizon() graph.PrimaryKey { return graph.NewSequentialKey(0) }
 
-func (qs *store) RemoveQuad(t quad.Quad) {}
+func (qs *store) DebugPrint() {}
 
-func (qs *store) Type() string { return "mockstore" }
+func (qs *store) QuadIterator(d quad.Direction, i graph.Value) graph.Iterator {
+	fixed := qs.FixedIterator()
+	for _, q := range qs.data {
+		if q.Get(d) == i.(string) {
+			fixed.Add(q)
+		}
+	}
+	return fixed
+}
+
+func (qs *store) NodesAllIterator() graph.Iterator {
+	set := make(map[string]bool)
+	for _, q := range qs.data {
+		for _, d := range quad.Directions {
+			set[q.Get(d)] = true
+		}
+	}
+	fixed := qs.FixedIterator()
+	for k, _ := range set {
+		fixed.Add(k)
+	}
+	return fixed
+}
+
+func (qs *store) QuadsAllIterator() graph.Iterator {
+	fixed := qs.FixedIterator()
+	for _, q := range qs.data {
+		fixed.Add(q)
+	}
+	return fixed
+}
+
+func (qs *store) Size() int64 { return int64(len(qs.data)) }
