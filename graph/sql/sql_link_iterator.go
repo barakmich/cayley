@@ -57,6 +57,10 @@ func (t tagDir) TableHashOnly() string {
 	return fmt.Sprintf("%s.%s_hash", t.table, t.dir)
 }
 
+func (t tagDir) TagsOnly() string {
+	return fmt.Sprintf("\"%s\", %s_hash", t.tag, t.tag)
+}
+
 func (t tagDir) String() string {
 	if t.dir == quad.Any {
 		if t.justLocal {

@@ -36,10 +36,10 @@ type SQLRecursive struct {
 	result string
 }
 
-func newRecursive(nodeIt sqlIterator, morphism graph.ApplyMorphism) (*SQLRecursive, error) {
+func newRecursive(nodeIt sqlIterator, morphism graph.ApplyMorphism, qs graph.QuadStore) (*SQLRecursive, error) {
 	all := NewAllIterator(nil, "nodes")
 	all.Tagger().Add("__rec_base")
-	it := morphism(nil, all)
+	it := morphism(qs, all)
 	newIt, ok := it.Optimize()
 	if !ok {
 		return nil, errors.New("couldn't optimize")
@@ -116,16 +116,16 @@ func (r *SQLRecursive) getTables() []tableDef {
 	return []tableDef{td}
 }
 
-var frontParams = []string{"__rec_id", "__rec_depth", "__rec_path", "__rec_cycle"}
-
 func (r *SQLRecursive) buildRecursiveSubquery() (string, []string) {
 	var values []string
 	query := "WITH RECURSIVE\n"
 	query += r.recTableName + "("
-	tags := r.nodeIt.getTags()
-	params := append([]string{}, frontParams...)
+	topData := r.nodeIt.tableID()
+	tags := []tagDir{topData}
+	tags = append(tags, r.nodeIt.getTags()...)
+	params := []string{"__rec_id", "__rec_depth", "__rec_path", "__rec_cycle"}
 	for _, v := range tags {
-		params = append(params, v.tag)
+		params = append(params, v.TagsOnly())
 	}
 	query += strings.Join(params, ",")
 	query += ") AS (\n"
@@ -178,10 +178,10 @@ func (r *SQLRecursive) buildBaseCase() (string, []string) {
 
 func (r *SQLRecursive) buildRecursiveStep() (string, []string) {
 	topData := r.stepIt.tableID()
-	tags := []tagDir{topData}
-	tags = append(tags, r.nodeIt.getTags()...)
+	tags := r.nodeIt.getTags()
 	query := "SELECT "
 	t := []string{"__rec_id", "prev.__rec_depth + 1", "__rec_path || __rec_id", "__rec_id = ANY(__rec_path)"}
+	t = append(t, topData.String())
 	for _, v := range tags {
 		t = append(t, fmt.Sprintf("prev.%s", v.tag))
 	}
@@ -190,7 +190,7 @@ func (r *SQLRecursive) buildRecursiveStep() (string, []string) {
 
 	t = []string{}
 	var values []string
-	for _, k := range r.nodeIt.getTables() {
+	for _, k := range r.stepIt.getTables() {
 		values = append(values, k.values...)
 		t = append(t, fmt.Sprintf("%s as %s", k.table, k.name))
 	}
@@ -199,7 +199,7 @@ func (r *SQLRecursive) buildRecursiveStep() (string, []string) {
 	query += strings.Join(t, ", ")
 	query += " WHERE "
 
-	constraint, wherevalues := r.nodeIt.buildWhere()
+	constraint, wherevalues := r.stepIt.buildWhere()
 	values = append(values, wherevalues...)
 	if constraint != "" {
 		constraint += " AND "
@@ -212,8 +212,8 @@ func (r *SQLRecursive) buildRecursiveStep() (string, []string) {
 			break
 		}
 	}
-	constraint += fmt.Sprintf("__rec_id = %s", topData.TableHashOnly())
-	constraint += fmt.Sprintf("AND %s = prev.__rec_id", found.TableHashOnly())
+	constraint += fmt.Sprintf("__rec_id = %s ", topData.TableHashOnly())
+	constraint += fmt.Sprintf("AND %s = prev.__rec_id ", found.TableHashOnly())
 	constraint += "AND NOT __rec_cycle"
 
 	query += constraint
