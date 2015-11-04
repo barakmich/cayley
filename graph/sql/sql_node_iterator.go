@@ -32,6 +32,7 @@ const (
 	node sqlQueryType = iota
 	link
 	nodeIntersect
+	recursive
 )
 
 func init() {

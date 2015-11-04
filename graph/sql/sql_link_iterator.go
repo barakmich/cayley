@@ -47,6 +47,16 @@ type tagDir struct {
 	justLocal bool
 }
 
+func (t tagDir) TableHashOnly() string {
+	if t.dir == quad.Any {
+		if t.justLocal {
+			return fmt.Sprintf("%s.__execd_hash", t.table)
+		}
+		return fmt.Sprintf("%s.%s_hash", t.table, t.tag)
+	}
+	return fmt.Sprintf("%s.%s_hash", t.table, t.dir)
+}
+
 func (t tagDir) String() string {
 	if t.dir == quad.Any {
 		if t.justLocal {
